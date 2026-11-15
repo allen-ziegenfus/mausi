@@ -1,0 +1,19 @@
+{
+  "hooks": {
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/src/mausi-hook\" notify" } ] }
+    ],
+    "PreToolUse": [
+      { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/src/mausi-hook\" clear" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/src/mausi-hook\" clear" } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/src/mausi-hook\" clear" },
+        { "type": "command", "command": "python3 -I \"${CLAUDE_PLUGIN_ROOT}/src/mausi-guard\"", "timeout": 5 }
+      ] }
+    ]
+  }
+}

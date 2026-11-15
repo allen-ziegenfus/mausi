@@ -1,0 +1,206 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""mausi: Claude Code sessions in kitty tabs, one per task.
+
+    mausi                    # restore the last snapshot into kitty tabs, then
+                             # turn this window into the dashboard (tab 1)
+    mausi --no-dash          # restore only
+    mausi --from <tsv>       # restore an older snapshot (see: mausi snapshot --history)
+    mausi --restore          # restore even though Claude sessions are running
+    mausi dash               # just the dashboard
+    mausi snapshot           # record the open sessions now (the dashboard does it
+                             # every minute)
+    mausi snapshot --history # list earlier snapshots
+    mausi snapshot --resume  # print a resume command per session
+    mausi tasks ...          # the task store (same as `tasks ...`)
+    mausi setup              # offer the kitty, Claude Code and PATH setup that is
+                             # missing (plain `mausi` offers it too, once)
+
+Each restored tab carries kitty user vars the rest of mausi reads:
+claude_session (the session id) and claude_title (the tab's base title;
+mausi-mark adds and strips the ⏳ around it).
+"""
+import glob
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "src")
+sys.path.insert(0, SRC)
+
+from mausi_sessions import HIST, SNAP, live_sessions, read_snapshot  # noqa: E402
+import mausi_sessions as sessions  # noqa: E402
+
+
+def cmd_snapshot(args):
+    if "--history" in args:
+        files = sorted(glob.glob(os.path.join(HIST, "*.tsv")), key=os.path.getmtime, reverse=True)
+        if not files:
+            print(f"no history yet at {HIST}")
+            return 0
+        print(f"{'SNAPSHOT':<32} SESSIONS")
+        for f in files:
+            print(f"{os.path.basename(f):<32} {len(read_snapshot(f))}")
+        print(f"\nRestore an older one with:  mausi --from {HIST}/<file>")
+        return 0
+    if "--resume" in args:
+        rows = read_snapshot(SNAP)
+        if not rows:
+            print(f"no snapshot at {SNAP}")
+            return 1
+        for cwd, sid in rows:
+            print(f"(cd {shlex.quote(cwd)} && claude --resume {sid})")
+        return 0
+
+    n = sessions.write_snapshot()
+    if not n:
+        print(f"No live Claude sessions — kept the existing snapshot ({SNAP})")
+    else:
+        print(f"Wrote {n} sessions to {SNAP}")
+    return 0
+
+
+def kitty(*args):
+    return subprocess.run(["kitty", "@", *args], capture_output=True, text=True)
+
+
+def title_for(cwd):
+    """The ticket when the checkout is on a ticket branch, else the folder name."""
+    branch = subprocess.run(["git", "-C", cwd, "symbolic-ref", "--quiet", "--short", "HEAD"],
+                            capture_output=True, text=True).stdout.strip()
+    m = re.match(r"([A-Z][A-Z0-9]+-\d+)", branch)
+    return m.group(1) if m else os.path.basename(cwd.rstrip("/")) or cwd
+
+
+def start_dash():
+    """Turn this window into the dashboard, unless one already runs elsewhere."""
+    me = int(os.environ.get("KITTY_WINDOW_ID", "0"))
+    try:
+        tabs = json.loads(kitty("ls").stdout or "[]")
+    except ValueError:
+        tabs = []
+    for os_win in tabs:
+        for tab in os_win.get("tabs", []):
+            for w in tab.get("windows", []):
+                if w.get("id") == me or w.get("user_vars", {}).get("claude_dash") != "1":
+                    continue
+                if any("mausi-dash" in " ".join(p.get("cmdline", [])) for p in w.get("foreground_processes", [])):
+                    kitty("focus-tab", "--match", "var:claude_dash=1")
+                    return 0
+    kitty("set-user-vars", "--match", f"id:{me}", "claude_dash=1")
+    kitty("set-tab-title", "--match", f"window_id:{me}", "≡ dash")
+    os.execv(os.path.join(SRC, "mausi-dash"), ["mausi-dash"])
+
+
+def cmd_restore(args):
+    dash, restore, snap = True, False, SNAP
+    it = iter(args)
+    for a in it:
+        if a == "--no-dash":
+            dash = False
+        elif a == "--restore":
+            restore = True
+        elif a == "--from":
+            snap, restore = next(it, ""), True
+        else:
+            print(f"unknown arg: {a}", file=sys.stderr)
+            return 2
+
+    import mausi_setup
+    mausi_setup.run()
+    if not os.environ.get("KITTY_LISTEN_ON"):
+        if not os.environ.get("KITTY_WINDOW_ID"):
+            print("Run mausi inside kitty.", file=sys.stderr)
+        elif mausi_setup.kitty_ok():
+            print("kitty hasn't loaded mausi's settings yet: restart kitty, then run mausi again.",
+                  file=sys.stderr)
+        else:
+            print("kitty needs mausi's settings for remote control: run `mausi setup`.", file=sys.stderr)
+        return 1
+
+    live = live_sessions()
+    running = {sid for _, sid in live}
+    try:
+        for os_win in json.loads(kitty("ls").stdout or "[]"):
+            for tab in os_win.get("tabs", []):
+                for w in tab.get("windows", []):
+                    if w.get("user_vars", {}).get("claude_session"):
+                        running.add(w["user_vars"]["claude_session"])
+    except ValueError:
+        pass
+
+    rows = read_snapshot(snap)
+    if not rows and not os.path.exists(snap):
+        print(f"No snapshot at {snap} — nothing to restore yet.")
+    if live and not restore:
+        print("Claude sessions are already running — not restoring (mausi --restore to restore anyway).")
+        rows = []
+
+    restored = failed = skipped = already = 0
+    titles = set()
+    shell = os.environ.get("SHELL") or "/bin/bash"
+    for cwd, sid in rows:
+        if not os.path.isdir(cwd):
+            print(f"skip: {cwd} no longer exists", file=sys.stderr)
+            skipped += 1
+            continue
+        # Two writers on one transcript corrupt it: never resume a session
+        # that is open anywhere already.
+        if sid in running:
+            already += 1
+            continue
+        title = title_for(cwd)
+        if title in titles:
+            title = f"{title}-{sid[:6]}"
+        titles.add(title)
+        q = shlex.quote(sid)
+        # Keep the tab (with a shell) if the resume fails, so the failure shows.
+        cmd = (f"claude --resume {q}; rc=$?; if [ $rc -ne 0 ]; then "
+               f"printf '\\n[mausi] claude --resume %s exited %s — leaving a shell here\\n' {q} \"$rc\"; "
+               f"exec {shlex.quote(shell)} -l; fi")
+        r = kitty("launch", "--type=tab", "--keep-focus", f"--cwd={cwd}", f"--tab-title={title}",
+                  "--var", f"claude_session={sid}", "--var", f"claude_title={title}", shell, "-lc", cmd)
+        if r.returncode == 0:
+            restored += 1
+        else:
+            print(f"failed to open a tab for {cwd} ({sid})", file=sys.stderr)
+            failed += 1
+
+    msg = f"Restored {restored} sessions into kitty tabs."
+    if already:
+        msg += f" {already} already running."
+    if skipped:
+        msg += f" {skipped} skipped (directory gone)."
+    if failed:
+        msg += f" {failed} failed."
+    print(msg)
+    return start_dash() if dash else 0
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] in (["-h"], ["--help"], ["help"]):
+        print(__doc__.strip())
+        return 0
+    if args[:1] == ["dash"]:
+        os.execv(os.path.join(SRC, "mausi-dash"), ["mausi-dash", *args[1:]])
+    if args[:1] == ["tasks"]:
+        os.execv(os.path.join(HERE, "tasks"), ["tasks", *args[1:]])
+    if args[:1] == ["snapshot"]:
+        return cmd_snapshot(args[1:])
+    if args[:1] == ["setup"]:
+        import mausi_setup
+        mausi_setup.run(ask_again=True)
+        return 0
+    return cmd_restore(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

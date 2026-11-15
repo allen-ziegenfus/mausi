@@ -1,0 +1,248 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyyaml>=6"]
+# ///
+"""The task store from the command line (see mausi_tasks.py).
+
+    tasks                          # open tasks: id, section, title, files
+    tasks new "Title" [-s SECTION] [-n NOTE]...   # prints the new id
+    tasks note T-12 "text"        # append a note line
+    tasks done T-12 | tasks undone T-12
+    tasks show T-12               # TASK.md
+    tasks path T-12               # the task's folder (cd "$(tasks path T-12)")
+    tasks find scaling cx [-o]     # tasks matching all words: keywords, title, notes, files (-o: open only)
+    tasks tag T-12 cx scaling [-r]   # add (-r: remove) search keywords; no words: show them
+    tasks sync                     # regenerate the overview after editing TASK.md files
+    tasks effort [T-12]           # time spent (from my messages in its Claude sessions) and timespan
+    tasks spent T-12 1.5 [note]   # add time spent outside Claude, in hours
+    tasks link                     # link worktrees into <task>/code/ (the dashboard does it every minute)
+    tasks code T-12 [-p]          # write <task>/T-12.code-workspace and open it in VS Code (-p: print path only)
+    tasks init                     # create an empty store (root folder + git repo)
+    tasks migrate                  # one time: split an existing Markdown task list (the overview path) into task folders
+
+A task can be named by id or by (the start of) its title.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "src"))
+import mausi_tasks as store  # noqa: E402
+
+PINS = os.path.join(store.cfg.CACHE_DIR, "tasks-pins.json")  # title -> "### section" (pre-store pins)
+
+
+def need(ref):
+    t = store.find(ref)
+    if not t:
+        sys.exit(f"no task {ref!r} (use an id like T-12, or the start of a title)")
+    return t
+
+
+def cmd_list(args):
+    for t in store.load_all():
+        if t.get("status") != "open" and not args.all:
+            continue
+        n = len(store.files(t))
+        mark = "" if t.get("status") == "open" else f" [done {t.get('done')}]"
+        print(f"{t['id']:<7} {t.get('section', '').split(' (')[0][:18]:<18} {t['title'][:90]}"
+              + (f"  ({n} file{'s' if n != 1 else ''})" if n else "") + mark)
+
+
+def cmd_find(args):
+    results = store.search(args.terms, include_done=not args.open)
+    if not results:
+        sys.exit("no matching tasks")
+    for t, tier, hits in results[:args.limit]:
+        mark = "" if t.get("status") == "open" else f" [done {t.get('done')}]"
+        print(f"{t['id']:<7} {t['title'][:80]}{mark}  ({tier})")
+        for where, line in hits:
+            print(f"        {where}: {line[:110]}")
+    if len(results) > args.limit:
+        print(f"… {len(results) - args.limit} more (--limit)")
+
+
+def cmd_effort(args):
+    tasks = [need(args.task)] if args.task else [t for t in store.load_all()
+                                                if t.get("status") == "open" or args.all]
+    efforts = store.efforts(tasks)
+    if args.task:
+        print(f"{tasks[0]['id']} {tasks[0]['title']}\n  {store.effort_text(tasks[0], efforts[tasks[0]['id']])}")
+        return
+    total = 0
+    for t in sorted(tasks, key=lambda t: -(efforts[t["id"]]["secs"] + efforts[t["id"]]["extra"] * 3600)):
+        e = efforts[t["id"]]
+        secs = (t["effort"]["hours"] * 3600 if t.get("status") == "done" and t.get("effort") else e["secs"]) \
+            + e["extra"] * 3600
+        if secs or args.all:
+            total += secs
+            print(f"{t['id']:<7} {store.hours(secs):>7}  {t['title'][:70]}")
+    print(f"{'':<7} {store.hours(total):>7}  total")
+
+
+def migrate(args):
+    lines = open(store.OVERVIEW).read().split("\n")
+    if any(store.ID_RE.fullmatch(d) for d in (os.listdir(store.ROOT) if os.path.isdir(store.ROOT) else [])):
+        sys.exit(f"{store.ROOT} already has tasks; migrate runs once")
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = f"{store.OVERVIEW}.bak-{stamp}-before-store"
+    shutil.copy2(store.OVERVIEW, backup)
+    os.makedirs(store.ROOT, exist_ok=True)
+    shutil.copy2(store.OVERVIEW, os.path.join(store.ROOT, "original-tasks.md"))
+    try:
+        pins = json.load(open(PINS))
+    except (OSError, ValueError):
+        pins = {}
+
+    start, done_at = lines.index("## Open"), lines.index("## Done")
+    sections, items, section, item = [], [], None, None
+    for line in lines[start + 1:done_at]:
+        if line.startswith("### "):
+            section = {"heading": line[4:].strip(), "note": None}
+            sections.append(section)
+            item = None
+        elif re.match(r"- ", line):
+            m = re.match(r"- (\[( |x)\] )?(.*)", line)
+            if section is None:  # above the first heading
+                section = {"heading": "", "note": None}
+                sections.append(section)
+            item = {"section": section["heading"], "done": m.group(2) == "x", "head": m.group(3), "notes": []}
+            items.append(item)
+        elif line.startswith("  ") and item is not None:
+            item["notes"].append(line[2:])
+        elif line.strip() and section is not None:
+            section["note"] = ((section["note"] + "\n") if section["note"] else "") + line
+            section["note_after"] = any(i["section"] == section["heading"] for i in items)
+    while items and items[-1]["notes"] and not items[-1]["notes"][-1].strip():
+        items[-1]["notes"].pop()
+
+    store.write_atomic(store.SECTIONS, json.dumps(sections, ensure_ascii=False, indent=1))
+    store.write_atomic(store.DONE_ARCHIVE, "\n".join(lines[done_at + 1:]).strip("\n") + "\n")
+    order = {}
+    for n, it in enumerate(items, 1):
+        bold = re.match(r"\*\*(.+?)\*\*\s*(.*)", it["head"])
+        title, summary = (bold.group(1).strip(), bold.group(2).strip()) if bold else (it["head"].strip(), "")
+        notes = it["notes"]
+        while notes and not notes[-1].strip():
+            notes.pop()
+        text = "\n".join([it["head"]] + notes)
+        added = re.search(r"Added: (\d{4}-\d\d-\d\d)", text)
+        done = re.search(r"Done: (\d{4}-\d\d-\d\d)", text)
+        pinned = pins.get(title)
+        tid = f"{store.PREFIX}-{n}"
+        order[it["section"]] = order.get(it["section"], -1) + 1
+        t = {"id": tid, "title": title, "summary": summary, "section": it["section"], "order": order[it["section"]],
+             "status": "done" if it["done"] else "open", "added": added.group(1) if added else None,
+             "done": (done.group(1) if done else time.strftime("%Y-%m-%d")) if it["done"] else None,
+             "pinned_from": pinned[4:] if pinned and pinned.startswith("### ") else pinned, "notes": notes}
+        store.write_atomic(store.task_path(tid), store._text(t))
+    store.write_atomic(store.COUNTER, str(len(items)))
+    with open(os.path.join(store.ROOT, ".gitignore"), "w") as f:
+        f.write(store.GITIGNORE)
+    subprocess.run(["git", "init", "-q", store.ROOT], check=True)
+    store.render(f"split tasks.md into {len(items)} tasks")
+    print(f"{len(items)} tasks in {store.ROOT} ({sum(i['done'] for i in items)} already checked off → done); "
+          f"tasks.md backed up to {backup}")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+    ls = sub.add_parser("list")
+    ls.add_argument("-a", "--all", action="store_true", help="done tasks too")
+    new = sub.add_parser("new")
+    new.add_argument("title")
+    new.add_argument("-s", "--section", default=store.DEFAULT_SECTION)
+    new.add_argument("-n", "--note", action="append", default=[])
+    note = sub.add_parser("note")
+    note.add_argument("task")
+    note.add_argument("text", nargs="+")
+    for name in ("done", "undone", "show", "path"):
+        sub.add_parser(name).add_argument("task")
+    find = sub.add_parser("find")
+    find.add_argument("terms", nargs="+")
+    find.add_argument("-o", "--open", action="store_true", help="open tasks only")
+    find.add_argument("-n", "--limit", type=int, default=15)
+    tag = sub.add_parser("tag")
+    tag.add_argument("task")
+    tag.add_argument("words", nargs="*")
+    tag.add_argument("-r", "--remove", action="store_true")
+    effort = sub.add_parser("effort")
+    effort.add_argument("task", nargs="?")
+    effort.add_argument("-a", "--all", action="store_true", help="done tasks too")
+    spent = sub.add_parser("spent")
+    spent.add_argument("task")
+    spent.add_argument("hours", type=float)
+    spent.add_argument("note", nargs="*")
+    sub.add_parser("sync")
+    sub.add_parser("link")
+    code = sub.add_parser("code")
+    code.add_argument("task")
+    code.add_argument("-p", "--print", action="store_true", help="write the workspace, print its path, don't open")
+    sub.add_parser("init")
+    sub.add_parser("migrate")
+    args = p.parse_args()
+
+    if args.cmd in (None, "list"):
+        args.all = getattr(args, "all", False)
+        cmd_list(args)
+    elif args.cmd == "new":
+        print(store.create(args.title, section=args.section,
+                           notes=[f"- {n}" for n in args.note] + [f"- Added: {time.strftime('%Y-%m-%d')}"]))
+    elif args.cmd == "note":
+        t = need(args.task)
+        print("added" if store.add_notes(t, [" ".join(args.text)]) else "already there")
+    elif args.cmd in ("done", "undone"):
+        t = need(args.task)
+        store.set_done(t, args.cmd == "done")
+        print(f"{t['id']} {'done' if args.cmd == 'done' else 'reopened'}: {t['title']}")
+    elif args.cmd == "show":
+        print(open(need(args.task)["path"]).read(), end="")
+    elif args.cmd == "path":
+        print(os.path.dirname(need(args.task)["path"]))
+    elif args.cmd == "find":
+        cmd_find(args)
+    elif args.cmd == "tag":
+        t = need(args.task)
+        words = [w for arg in args.words for w in re.split(r"[,\s]+", arg) if w]
+        kw = store.set_keywords(t, words, args.remove) if words else (t.get("keywords") or [])
+        print(f"{t['id']}: {', '.join(kw) or '(no keywords)'}")
+    elif args.cmd == "sync":
+        print("regenerated" if store.sync() else "already up to date")
+    elif args.cmd == "effort":
+        cmd_effort(args)
+    elif args.cmd == "spent":
+        t = need(args.task)
+        store.spend(t, args.hours, " ".join(args.note))
+        print(f"{t['id']}: {store.effort_text(t)}")
+    elif args.cmd == "link":
+        added = store.link_worktrees()
+        print("\n".join(added) if added else "all worktree links in place")
+    elif args.cmd == "code":
+        t = need(args.task)
+        store.link_worktrees(only=t["id"])
+        path = store.write_workspace(t)
+        store.write_project_list()
+        if args.print:
+            print(path)
+        else:
+            subprocess.run(["code", path])
+    elif args.cmd == "init":
+        done = store.init()
+        print(f"{store.ROOT}: " + (", ".join(done) if done else "already set up"))
+    elif args.cmd == "migrate":
+        migrate(args)
+
+
+if __name__ == "__main__":
+    main()
+    if store.GIT_PROBLEM:
+        print(f"warning: the task store's changes weren't committed: {store.GIT_PROBLEM}", file=sys.stderr)
+    for tid, why in sorted(store.BROKEN.items()):
+        print(f"warning: {tid} skipped, its TASK.md can't be read: {why}", file=sys.stderr)

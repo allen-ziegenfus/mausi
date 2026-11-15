@@ -1,0 +1,14 @@
+{
+  "name": "mausi",
+  "description": "mausi: many Claude Code sessions in kitty, one per task.",
+  "owner": {
+    "name": "Allen Ziegenfus"
+  },
+  "plugins": [
+    {
+      "name": "mausi",
+      "source": "./",
+      "description": "Claude Code side of mausi: kitty notifications and tab markers, the task guard, and the task-store skill."
+    }
+  ]
+}

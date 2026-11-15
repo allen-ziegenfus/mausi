@@ -1,0 +1,55 @@
+# mausi config: copy to ~/.config/mausi/config.toml and change what you need.
+# The file is optional, and so is every key; the values below are the
+# defaults. Paths may start with ~.
+
+[tasks]
+root = "~/tasks"                 # one folder per task: <root>/<prefix>-<n>/TASK.md
+prefix = "T"                     # task ids are T-1, T-2, …; pick one no Jira project uses
+overview = "~/.claude/tasks.md"  # generated Markdown overview, for you and for Claude
+worktrees = ""                   # folder of <repo>-<TICKET> git worktrees, linked into <task>/code/
+git_name = "mausi"               # author of the task store's automatic commits
+git_email = "mausi@localhost"
+
+[dash]
+list_sections = ["Follow-ups"]   # overview sections listed task by task; the others are counted
+hide_tasks = []                  # tasks whose title contains one of these stay off the dashboard
+late_hour = 20                   # active time after this hour gets a "wrap up?"
+github_user = ""                 # your GitHub login, for the PR lists
+
+[breaks]
+gap_minutes = 5                  # a pause this long between your prompts counts as a break
+warn_minutes = 50                # the break timer turns yellow
+due_minutes = 60                 # red, and the break window opens
+
+[energy]
+log = ""                         # a Markdown energy log, e.g. "~/notes/energy.md"; empty = off (L key)
+
+[notes]
+dir = "~/notes"                  # snippets.md and notes.md for the Notes section
+
+[notifications]
+capture = false                  # Linux: the dashboard runs mausi-notif-capture, which logs every desktop notification
+log = ""                         # where mausi-notif-capture writes (Linux); empty = ~/.local/state/mausi/notifications.jsonl
+my_name = ""                     # an @mention of this name highlights a Slack conversation
+
+[sessions]
+snapshot = "~/.claude/open-sessions.tsv"  # the open sessions, restored by `mausi`
+history = "~/.claude/session-history"
+
+# --- optional extensions: each is off until set ---------------------------
+
+[board]
+url = ""                         # a local board serving /api/dash.json (PRs, Jira); enables the Work sections
+
+[jira]
+site = ""                        # e.g. "https://example.atlassian.net", for ticket links
+
+[review]
+forward_owner = ""               # GitHub owner of the repo PRs get forwarded to for a final review
+forward_name = ""                # who that is ("waiting on <name>", the stage label)
+
+[commands]
+calendar = ""                    # prints today's meetings as JSON; an optional YYYY-MM-DD argument for another day
+mail = ""                        # prints unread mail as JSON
+mail_open = ""                   # opens one mail; {id} becomes its Message-ID
+worktree = ""                    # creates or opens a ticket's worktree: <command> <KEY> [repo]

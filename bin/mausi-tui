@@ -1,0 +1,347 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyyaml", "textual>=8.0"]
+# ///
+"""The mausi dashboard on Textual (try-out, next to mausi-dash).
+
+Same sections, same keys: it loads mausi-dash as a module and uses its data
+functions, its Ui state (selection, zoom, searches, prompts) and its key
+handling (process_key). Only the drawing and the input are Textual's:
+
+- the pop-up (Space) wraps and scrolls in Textual, with the mouse too
+- prompts are a real text field: cursor keys, Home/End, paste
+- a click selects a row, a double-click opens it; the wheel scrolls the
+  column under the pointer
+
+    mausi-tui [--view work|tasks]
+"""
+import importlib.machinery
+import importlib.util
+import os
+import sys
+import threading
+import time
+
+SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "src")
+sys.path.insert(0, SRC)
+
+
+def _load_dash():
+    loader = importlib.machinery.SourceFileLoader("mausi_dash", os.path.join(SRC, "mausi-dash"))
+    spec = importlib.util.spec_from_loader("mausi_dash", loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["mausi_dash"] = module
+    loader.exec_module(module)
+    return module
+
+
+dash = _load_dash()
+
+from rich.text import Text  # noqa: E402
+from textual import events  # noqa: E402
+from textual.app import App, ComposeResult  # noqa: E402
+from textual.containers import Horizontal, VerticalScroll  # noqa: E402
+from textual.widget import Widget  # noqa: E402
+from textual.widgets import Input, Static  # noqa: E402
+
+# Textual key names -> the keys mausi-dash's process_key expects.
+KEYMAP = {"up": "up", "down": "down", "left": "left", "right": "right", "tab": "\t",
+          "shift+tab": "backtab", "pageup": "pgup", "pagedown": "pgdn", "enter": "\r",
+          "escape": "\033", "space": " ", "backspace": "\x7f", "ctrl+u": "\x15"}
+
+
+def ansi(s):
+    return Text.from_ansi(s, no_wrap=True, end="")
+
+
+class Column(Widget):
+    """One list (dash.Ui.lines[v]), drawn by dash.Ui.column."""
+
+    can_focus = False
+
+    def __init__(self, side, **kw):
+        super().__init__(**kw)
+        self.side = side  # 0 left, 1 right
+
+    def view_index(self):
+        return self.app.column_view(self.side)
+
+    def render(self):
+        ui, v = self.app.ui, self.view_index()
+        if v is None:
+            return Text("")
+        width, height = self.size.width, self.size.height
+        if width < 2 or height < 1:
+            return Text("")
+        focused = self.app.focused_view() == v
+        return Text("\n").join(ansi(line) for line in ui.column(v, width, height, focused))
+
+    def _focus_me(self):
+        ui = self.app.ui
+        v = self.view_index()
+        if ui.zoom or v is None:
+            return v
+        if ui.tasks:
+            ui.tview = v
+        else:
+            ui.view = v
+        return v
+
+    def on_mouse_scroll_down(self, event):
+        event.stop()
+        if self.view_index() is not None:
+            self._focus_me()
+            self.app.ui.move(3)
+            self.app.redraw()
+
+    def on_mouse_scroll_up(self, event):
+        event.stop()
+        if self.view_index() is not None:
+            self._focus_me()
+            self.app.ui.move(-3)
+            self.app.redraw()
+
+    def on_click(self, event: events.Click):
+        ui = self.app.ui
+        v = self._focus_me()
+        if v is None:
+            return
+        line = ui.offset[v] + event.y
+        actionable = [i for i, (_, a) in enumerate(ui.lines[v]) if a]
+        if line in actionable:
+            ui.selected[v] = actionable.index(line)
+            if event.chain >= 2:
+                self.app.feed("\r")
+        self.app.redraw()
+
+
+class Dashboard(App):
+    CSS = """
+    Screen { layers: base popup; }
+    #header, #keys { height: 1; }
+    #gap { height: 1; }
+    #body { height: 1fr; }
+    #left, #right { width: 1fr; height: 100%; }
+    #right { border-left: vkey $foreground 30%; }
+    #ask { dock: bottom; height: 1; display: none; background: $panel; }
+    #ask-label { width: auto; padding: 0 1; }
+    #ask Input { border: none; height: 1; padding: 0; width: 1fr; background: $panel; }
+    #popup {
+        layer: popup; display: none;
+        width: 110; max-width: 95%; height: 10;
+        margin: 1 0 0 0;
+        border: round $accent; border-title-style: bold; border-subtitle-color: $text-muted;
+        padding: 0 1; background: $surface;
+    }
+    Screen { align-horizontal: center; }
+    """
+    # Textual's own bindings (Tab focus, ^p palette) would take keys the
+    # dashboard uses; everything goes through on_key.
+    ENABLE_COMMAND_PALETTE = False
+
+    def __init__(self):
+        super().__init__()
+        self.ui = dash.Ui(dash.start_view())
+        self.rows = []
+        self.two = False
+        self.prompt_id = None
+        self.popup_key = None
+        self.wakes = None
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="header")
+        yield Static(id="keys")
+        yield Static(id="gap")
+        with Horizontal(id="body"):
+            yield Column(0, id="left")
+            yield Column(1, id="right")
+        with Horizontal(id="ask"):
+            yield Static(id="ask-label")
+            yield Input(id="ask-input")
+        with VerticalScroll(id="popup"):
+            yield Static(id="popup-text")
+
+    def on_mount(self):
+        self.wakes = dash.start_loops()
+        self.poll_sessions()
+        self.set_interval(dash.SESSION_REFRESH, self.poll_sessions)
+        self.set_interval(1, self.redraw)
+
+    # --- data -------------------------------------------------------------
+
+    def poll_sessions(self):
+        """kitty @ ls + git per tab, off the UI thread."""
+        def work():
+            rows = dash.sessions()
+            threading.Thread(target=dash.fetch_jira, args=({r["ticket"] for r in rows},),
+                             daemon=True).start()
+            self.call_from_thread(self._got_sessions, rows)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _got_sessions(self, rows):
+        self.rows = rows
+        self.redraw()
+
+    # --- which list is where ----------------------------------------------
+
+    def column_view(self, side):
+        """The dash.Ui.lines index shown in the left (0) or right (1) column,
+        or None when the right one is hidden."""
+        ui = self.ui
+        if ui.zoom:
+            return 2 if side == 0 else None
+        if ui.tasks:
+            return (3, 4)[side] if self.two else (ui.tview if side == 0 else None)
+        return side if self.two else (ui.view if side == 0 else None)
+
+    def focused_view(self):
+        return self.ui.current()
+
+    # --- drawing ----------------------------------------------------------
+
+    def redraw(self):
+        ui = self.ui
+        width = self.size.width
+        self.two = ui.prepare(self.rows, width)
+        tabs, keyline = ui.status(self.two)
+        self.query_one("#header", Static).update(
+            ansi(f"{dash.BOLD}mausi{dash.RESET} {dash.DIM}{time.strftime('%H:%M:%S')}{dash.RESET}  {tabs}"))
+        self.query_one("#keys", Static).update(ansi(keyline))
+        self.query_one("#right").display = self.column_view(1) is not None
+        self.query_one("#left").refresh()
+        self.query_one("#right").refresh()
+        self._draw_ask()
+        self._draw_popup()
+
+    def _draw_ask(self):
+        ui = self.ui
+        box = self.query_one("#ask")
+        field = self.query_one("#ask-input", Input)
+        label = self.query_one("#ask-label", Static)
+        if ui.prompt:
+            if self.prompt_id != id(ui.prompt):  # a new (or chained) prompt
+                self.prompt_id = id(ui.prompt)
+                label.update(ui.prompt["label"])
+                with field.prevent(Input.Changed):
+                    field.value = ui.prompt["text"]
+                field.cursor_position = len(field.value)
+            box.display = True
+            field.display = True
+            if not field.has_focus:
+                field.focus()
+        elif ui.confirm:
+            self.prompt_id = None
+            label.update(f"{ui.confirm[0]} [y/N]")
+            box.display = True
+            field.display = False
+            self.set_focus(None)
+        else:
+            self.prompt_id = None
+            box.display = False
+            if field.has_focus:
+                self.set_focus(None)
+
+    def _draw_popup(self):
+        ui = self.ui
+        pop = self.query_one("#popup", VerticalScroll)
+        if not ui.popup:
+            pop.display = False
+            self.popup_key = None
+            return
+        title, text, action = ui.popup
+        if action.get("issue"):
+            text = dash.issue_text(action["issue"], action["detail"][1])
+        elif action.get("pr"):
+            text = dash.pr_text(action["pr"], action["detail"][1])
+        key = (title, text)
+        if key != self.popup_key:
+            fresh = self.popup_key is None or self.popup_key[0] != title
+            self.popup_key = key
+            self.query_one("#popup-text", Static).update(Text.from_ansi(text))
+            if fresh:
+                pop.scroll_home(animate=False)
+        pop.border_title = title
+        # Sized from the wrapped text: with height auto, Textual's scroll range
+        # came out short and the end of long text (the help) was unreachable.
+        inner = max(10, min(110, int(self.size.width * 0.95)) - 4)
+        wrapped = sum(max(1, -(-Text.from_ansi(line).cell_len // inner)) for line in text.split("\n"))
+        room = max(3, self.size.height - 4)
+        pop.styles.height = min(wrapped, room) + 2
+        where = ""
+        if wrapped > room:
+            shown = min(wrapped, int(pop.scroll_y) + room)
+            where = f" · {shown}/{wrapped}" + (" ↓ more" if shown < wrapped else "")
+        pop.border_subtitle = (("Enter open · " if action.get("open") else "") + "j/k ↑↓ scroll · "
+                               + ("c copy TASK.md · " if action.get("task") else "c copy file · "
+                                  if action.get("file") else "c copy · " if action else "")
+                               + "Esc/Space close" + where)
+        pop.display = True
+
+    # --- input ------------------------------------------------------------
+
+    def feed(self, key):
+        if dash.process_key(self.ui, key, self.wakes):
+            self.exit()
+            return
+        self.redraw()
+
+    def on_key(self, event: events.Key):
+        ui = self.ui
+        key = KEYMAP.get(event.key)
+        if key is None and event.character and event.character.isprintable():
+            key = event.character
+        if key is None:
+            return
+        if ui.prompt:
+            # The text field types, edits and pastes by itself; Enter comes as
+            # Input.Submitted. Esc, and ↑↓ PgUp PgDn in a search, go to mausi.
+            field = self.query_one("#ask-input", Input)
+            if key == "\033" or (ui.prompt.get("live") and key in ("up", "down", "pgup", "pgdn")):
+                event.prevent_default()
+                event.stop()
+                self.feed(key)
+            elif not field.has_focus:
+                # Typed in the same burst as the key that opened the prompt,
+                # before the field had focus.
+                self._draw_ask()
+                event.prevent_default()
+                event.stop()
+                if key == "\r":
+                    self.on_input_submitted(Input.Submitted(field, field.value))
+                elif len(key) == 1 and key.isprintable():
+                    field.insert_text_at_cursor(key)
+            return
+        event.prevent_default()
+        event.stop()
+        if ui.popup:
+            pop = self.query_one("#popup", VerticalScroll)
+            step = {"j": 1, "down": 1, "k": -1, "up": -1, "pgdn": 15, "pgup": -15}.get(key)
+            if step:
+                # From the target, not the current position: keys in a burst
+                # (a held j) arrive before the last scroll has been applied.
+                y = max(0, min(pop.max_scroll_y, pop.scroll_target_y + step))
+                pop.scroll_to(y=y, animate=False, immediate=True)
+                self.call_after_refresh(self._draw_popup)
+                return
+        self.feed(key)
+
+    def on_input_changed(self, event: Input.Changed):
+        ui = self.ui
+        if ui.prompt and event.value != ui.prompt["text"]:
+            ui.prompt["text"] = event.value
+            if ui.prompt.get("live"):
+                ui.search_edited()
+            self.redraw()
+
+    def on_input_submitted(self, event: Input.Submitted):
+        if self.ui.prompt:
+            self.ui.prompt["text"] = event.value
+            self.feed("\r")
+
+    def on_resize(self, event):
+        self.redraw()
+
+
+if __name__ == "__main__":
+    Dashboard().run()

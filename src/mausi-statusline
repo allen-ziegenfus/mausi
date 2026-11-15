@@ -1,0 +1,105 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""Claude Code status line: model | folder | task | context bar.
+
+Claude Code runs it after each message with the session's JSON on stdin
+(`statusLine` in ~/.claude/settings.json; `mausi setup` offers to set it).
+The task is the one whose folder the session runs in, or whose code/ links
+to the worktree it runs in. The context bar counts 80% as full, since Claude
+Code compacts around there.
+"""
+import glob
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import mausi_common as cfg  # noqa: E402
+
+RESET, DIM, BOLD, BLINK = "\033[0m", "\033[2m", "\033[1m", "\033[5m"
+GREEN, YELLOW, ORANGE, RED = "\033[32m", "\033[33m", "\033[38;5;208m", "\033[31m"
+
+
+def _inside(path, parent):
+    return path == parent or path.startswith(parent + os.sep)
+
+
+def task_of(cwd):
+    """(id, title) of the task this folder belongs to, or None."""
+    root = os.path.realpath(cfg.path("tasks", "root"))
+    cwd = os.path.realpath(cwd)
+    folder = None
+    if _inside(cwd, root) and cwd != root:
+        folder = os.path.join(root, os.path.relpath(cwd, root).split(os.sep)[0])
+    else:
+        for link in glob.glob(os.path.join(root, "*", "code", "*")):
+            try:
+                if _inside(cwd, os.path.realpath(link)):
+                    folder = os.path.dirname(os.path.dirname(link))
+                    break
+            except OSError:
+                pass
+    if not folder:
+        return None
+    try:
+        head = open(os.path.join(folder, "TASK.md")).read(4096)
+    except OSError:
+        return None
+    m = re.search(r"^title:\s*(.+)$", head, re.M)
+    title = m.group(1).strip().strip("'\"") if m else ""
+    return os.path.basename(folder), title
+
+
+def context_bar(used):
+    try:
+        scaled = min(100, round(float(used) / 0.8))
+    except (TypeError, ValueError):
+        return f"{BOLD}{GREEN}{'_' * 10}{RESET} 0%"
+    filled = min(10, int(scaled / 10 + 0.5))
+    if scaled >= 95:
+        color, skull = BOLD + BLINK + RED, " 💀"
+    elif scaled >= 65:
+        color, skull = BOLD + ORANGE, ""
+    elif scaled >= 50:
+        color, skull = BOLD + YELLOW, ""
+    else:
+        color, skull = BOLD + GREEN, ""
+    return f"{color}{'#' * filled}{'_' * (10 - filled)}{RESET} {scaled}%{skull}"
+
+
+def obj(data, key):
+    v = data.get(key)
+    return v if isinstance(v, dict) else {}
+
+
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    model = obj(data, "model").get("display_name") or "Unknown"
+    cwd = obj(data, "workspace").get("current_dir") or data.get("cwd") or os.getcwd()
+    if not isinstance(cwd, str):
+        cwd = os.getcwd()
+    used = obj(data, "context_window").get("used_percentage")
+    parts = [f"{DIM}{model}{RESET}", f"{DIM}{os.path.basename(cwd)}{RESET}"]
+    task = task_of(cwd)
+    if task:
+        tid, title = task
+        if len(title) > 40:
+            title = title[:39] + "…"
+        parts.append(f"{BOLD}{tid}{RESET} {title}".rstrip())
+    parts.append(context_bar(used))
+    print(" | ".join(parts))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:  # noqa: BLE001 — a traceback would end up in Claude Code's status line
+        print("mausi-statusline: error")

@@ -1,0 +1,202 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pywayland; sys_platform == 'linux'"]
+# ///
+"""Open a link in the default browser, and on COSMIC bring the browser to the front.
+
+    mausi-open URL
+
+On Wayland a program may only raise another app's window with a focus token,
+which terminals don't pass on: the browser opens the link in a tab behind
+the terminal. COSMIC lets a client activate a window through its own
+protocols (zcosmic_toplevel_manager_v1), so on COSMIC this:
+
+1. lists the browser's windows and their titles,
+2. hands the link to xdg-open,
+3. waits (up to 3 s) for one of those windows to change its title (the
+   new tab) or for a new one, and activates it; else the browser's first
+   window.
+
+Elsewhere it is plain `xdg-open` (or `open` on macOS, which raises the
+browser by itself). The dashboard opens links through it, and on COSMIC
+kitty/mausi.py sets it as kitty's `open_url_with`.
+
+The protocol bindings are generated with pywayland's scanner from
+protocols/*.xml (+ the system's wayland.xml) into ~/.cache/mausi/ on first
+use.
+"""
+import glob
+import hashlib
+import os
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+import mausi_common as cfg  # noqa: E402
+
+PROTOCOLS = os.path.join(os.path.dirname(HERE), "protocols")
+WAYLAND_XML = "/usr/share/wayland/wayland.xml"
+WAIT = 3.0
+ACTIVATED = 2  # zcosmic_toplevel_handle_v1.state.activated
+
+
+def on_cosmic():
+    return (not cfg.IS_MAC and bool(os.environ.get("WAYLAND_DISPLAY"))
+            and "COSMIC" in os.environ.get("XDG_CURRENT_DESKTOP", "").upper())
+
+
+def xdg_open(url):
+    cmd = ["open", url] if cfg.IS_MAC else ["xdg-open", url]
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def browser_app_id():
+    """The Wayland app id of the default browser: its .desktop file's
+    StartupWMClass, else the file's name (chromium.desktop -> chromium)."""
+    try:
+        desktop = subprocess.run(["xdg-mime", "query", "default", "x-scheme-handler/https"],
+                                 capture_output=True, text=True, timeout=3).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not desktop:
+        return None
+    dirs = [os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(cfg.HOME, ".local", "share"))]
+    dirs += (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":")
+    for d in dirs:
+        try:
+            for line in open(os.path.join(d, "applications", desktop)):
+                if line.startswith("StartupWMClass="):
+                    return line.split("=", 1)[1].strip()
+        except OSError:
+            continue
+    return desktop.removesuffix(".desktop")
+
+
+def bindings():
+    """Import the generated protocol package, generating it first if needed."""
+    sources = sorted(glob.glob(os.path.join(PROTOCOLS, "*.xml")))
+    if not sources or not os.path.exists(WAYLAND_XML):
+        raise RuntimeError("protocol files missing")
+    digest = hashlib.sha1()
+    for path in [WAYLAND_XML] + sources:
+        digest.update(open(path, "rb").read())
+    base = os.path.join(cfg.CACHE_DIR, "wayland", digest.hexdigest()[:12])
+    package = os.path.join(base, "mausi_wl")
+    if not os.path.exists(os.path.join(package, "__init__.py")):
+        tmp = f"{package}.tmp{os.getpid()}"
+        subprocess.run([sys.executable, "-m", "pywayland.scanner", "-i", WAYLAND_XML, *sources, "-o", tmp],
+                       check=True, capture_output=True, timeout=60)
+        open(os.path.join(tmp, "__init__.py"), "w").close()
+        try:
+            os.rename(tmp, package)
+        except OSError:  # another run made it first
+            pass
+    sys.path.insert(0, base)
+    import mausi_wl  # noqa: F401
+    return mausi_wl
+
+
+class Windows:
+    """The compositor's windows, with app id, title and a COSMIC handle."""
+
+    def __init__(self):
+        import struct
+        from pywayland.client import Display
+        bindings()
+        from mausi_wl.wayland import WlSeat
+        from mausi_wl.ext_foreign_toplevel_list_v1 import ExtForeignToplevelListV1
+        from mausi_wl.cosmic_toplevel_info_unstable_v1 import ZcosmicToplevelInfoV1
+        from mausi_wl.cosmic_toplevel_management_unstable_v1 import ZcosmicToplevelManagerV1
+        self.struct = struct
+        self.display = Display()
+        self.display.connect()
+        self.g = {}
+        wanted = {WlSeat.name: (WlSeat, 1), ExtForeignToplevelListV1.name: (ExtForeignToplevelListV1, 1),
+                  ZcosmicToplevelInfoV1.name: (ZcosmicToplevelInfoV1, 3),
+                  ZcosmicToplevelManagerV1.name: (ZcosmicToplevelManagerV1, 1)}
+
+        def on_global(registry, name, iface, version):
+            if iface in wanted and iface not in self.g:
+                cls, most = wanted[iface]
+                self.g[iface] = registry.bind(name, cls, min(version, most))
+        registry = self.display.get_registry()
+        registry.dispatcher["global"] = on_global
+        self.display.roundtrip()
+        missing = set(wanted) - set(self.g)
+        if missing:
+            raise RuntimeError(f"compositor lacks {', '.join(sorted(missing))}")
+        self.windows = []
+        self.g[ExtForeignToplevelListV1.name].dispatcher["toplevel"] = self._new
+        self.display.roundtrip()
+        self.display.roundtrip()
+
+    def _new(self, _list, handle):
+        w = {"handle": handle, "app_id": "", "title": "", "cosmic": None, "closed": False}
+        self.windows.append(w)
+        handle.dispatcher["app_id"] = lambda _h, v: w.__setitem__("app_id", v)
+        handle.dispatcher["title"] = lambda _h, v: w.__setitem__("title", v)
+        handle.dispatcher["closed"] = lambda _h: w.__setitem__("closed", True)
+
+    def update(self):
+        self.display.roundtrip()
+
+    def of(self, app_id):
+        return [w for w in self.windows if w["app_id"] == app_id and not w["closed"]]
+
+    def activate(self, w):
+        if w["cosmic"] is None:
+            w["cosmic"] = self.g["zcosmic_toplevel_info_v1"].get_cosmic_toplevel(w["handle"])
+        self.g["zcosmic_toplevel_manager_v1"].activate(w["cosmic"], self.g["wl_seat"])
+        self.display.roundtrip()
+
+    def close(self):
+        self.display.disconnect()
+
+
+def open_and_raise(url):
+    app_id = browser_app_id()
+    try:
+        wins = Windows() if app_id else None
+    except Exception:  # noqa: BLE001 — no COSMIC protocols: just open
+        wins = None
+    proc = xdg_open(url)
+    if wins is None:
+        return
+    try:
+        before = {id(w["handle"]): w["title"] for w in wins.of(app_id)}
+        target = None
+        deadline = time.time() + WAIT
+        while time.time() < deadline and target is None:
+            time.sleep(0.1)
+            wins.update()
+            for w in wins.of(app_id):
+                if before.get(id(w["handle"])) != w["title"]:  # new tab's title, or a new window
+                    target = w
+                    break
+        if target is None and proc.poll() is not None:
+            target = next(iter(wins.of(app_id)), None)
+        if target is not None:
+            wins.activate(target)
+        if os.environ.get("MAUSI_DEBUG"):
+            print(f"mausi-open: {app_id}: activated {target and target['title']!r} "
+                  f"after {WAIT - (deadline - time.time()):.2f}s", file=sys.stderr)
+    finally:
+        wins.close()
+
+
+def main():
+    if len(sys.argv) != 2:
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        sys.exit(2)
+    url = sys.argv[1]
+    if on_cosmic() and url.lower().startswith(("http://", "https://")):  # others may not go to the browser
+        open_and_raise(url)
+    else:
+        xdg_open(url)
+
+
+if __name__ == "__main__":
+    main()

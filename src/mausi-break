@@ -1,0 +1,174 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""The break reminder: a fullscreen kitty window mausi-dash opens when
+I've been going for an hour without a break (not counting calls and meetings).
+The same screen announces a meeting that is about to start.
+
+    mausi-break --since <epoch>   # when the current stretch started
+    mausi-break --meeting TITLE --start <epoch> [--meet URL] [--where TEXT]
+
+Meeting keys: Enter/j joins (opens the Meet link) and closes, q/Esc closes.
+
+Break keys: b starts a 5-minute break countdown, s snoozes 15 minutes, q/Esc closes
+and snoozes 30. The snooze is written to SNOOZE, which the dashboard checks
+before opening the screen again. The headline uses kitty's text sizing
+protocol (OSC 66), so it is drawn four cells tall.
+"""
+import os
+import select
+import shutil
+import sys
+import termios
+import time
+import tty
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import mausi_common as cfg  # noqa: E402
+
+SNOOZE = os.path.join(cfg.CACHE_DIR, "break-snooze")
+BREAK_SECS = 5 * 60
+
+
+def snooze(minutes):
+    cfg.write_atomic(SNOOZE, str(int(time.time() + minutes * 60)))
+
+
+def span(secs):
+    secs = int(secs)
+    return f"{secs // 3600}h{secs % 3600 // 60:02d}m" if secs >= 3600 else f"{secs // 60}m"
+
+
+def big(text, scale=4):
+    """text drawn `scale` cells tall (kitty text sizing), and its width in cells."""
+    return f"\033]66;s={scale};{text}\a", len(text) * scale
+
+
+def draw(lines):
+    """Centre (text, width, height) lines on a cleared screen."""
+    cols, rows = shutil.get_terminal_size()
+    total = sum(h for _, _, h in lines)
+    row = max(1, (rows - total) // 2)
+    out = ["\033[2J"]
+    for text, width, height in lines:
+        out.append(f"\033[{row};{max(1, (cols - width) // 2 + 1)}H{text}")
+        row += height
+    sys.stdout.write("".join(out))
+    sys.stdout.flush()
+
+
+def plain(text, color=""):
+    return (f"{color}{text}\033[0m", len(text), 2)
+
+
+def key(timeout):
+    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    return os.read(sys.stdin.fileno(), 32).decode(errors="ignore") if ready else None
+
+
+OPTIONS = ("--meeting", "--start", "--meet", "--where", "--since")
+
+
+def arg(name, default=None):
+    """The value after option `name`; read in pairs, so a title that looks like
+    an option ("--meeting --start") is still a title."""
+    args, i = sys.argv[1:], 0
+    while i < len(args):
+        if args[i] in OPTIONS and i + 1 < len(args):
+            if args[i] == name:
+                return cfg.clean(args[i + 1])
+            i += 2
+        else:
+            i += 1
+    return default
+
+
+def meeting():
+    """Count down to the meeting's start; Enter/j joins, q/Esc closes."""
+    title, start = arg("--meeting"), float(arg("--start", time.time()))
+    meet, where = arg("--meet"), arg("--where")
+    while True:
+        left = start - time.time()
+        if left > 0:
+            when = f"in {int(left) // 60}:{int(left) % 60:02d}"
+        else:
+            when = "now" if left > -60 else f"started {int(-left) // 60} min ago"
+        headline, width = big(f"Meeting {when}")
+        lines = [(f"\033[1;35m{headline}\033[0m", width, 5),
+                 plain(title[:100], "\033[1m"),
+                 plain(time.strftime("%H:%M", time.localtime(start)) + (f" · {where[:80]}" if where else ""), "\033[2m"),
+                 ("", 0, 1)]
+        if meet:
+            lines += [plain(meet, "\033[2m"), plain("[Enter] join   [q] close", "\033[36m")]
+        else:
+            lines.append(plain("[q] close", "\033[36m"))
+        draw(lines)
+        k = key(1)
+        if k in ("\n", "\r", "j", "J") and meet:
+            cfg.open_url(meet)
+            return
+        if k in ("q", "Q", "\033"):
+            return
+
+
+def main():
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    sys.stdout.write("\033[?25l")
+    try:
+        if "--meeting" in sys.argv:
+            meeting()
+        else:
+            take_break(float(arg("--since", time.time())))
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        sys.stdout.write("\033[?25h\033[2J")
+
+
+def take_break(since):
+    while True:
+        headline, width = big("Time for a break")
+        draw([
+            (f"\033[1;33m{headline}\033[0m", width, 5),
+            plain(f"You've been going for {span(time.time() - since)} "
+                  f"(since {time.strftime('%H:%M', time.localtime(since))})."),
+            plain("Stand up, look away from the screen, get some water.", "\033[2m"),
+            ("", 0, 1),
+            plain("[b] start a 5-minute break   [s] snooze 15 min   [q] close (30 min)", "\033[36m"),
+        ])
+        k = key(30)
+        if k is None:
+            continue
+        if k in ("s", "S"):
+            snooze(15)
+            return
+        if k in ("q", "Q", "\033"):
+            snooze(30)
+            return
+        if k in ("b", "B"):
+            break
+    snooze(BREAK_SECS / 60 + 10)  # no reminder while on the break or right after
+    end = time.time() + BREAK_SECS
+    while time.time() < end:
+        left = int(end - time.time())
+        clock, width = big(f"{left // 60}:{left % 60:02d}")
+        draw([(f"\033[1;32m{clock}\033[0m", width, 5),
+              plain("On a break. Step away — this window closes itself.", "\033[2m"),
+              plain("[q] end the break early", "\033[36m")])
+        if key(1) in ("q", "Q", "\033"):
+            return
+    welcome, width = big("Welcome back")
+    draw([(f"\033[1;32m{welcome}\033[0m", width, 5), plain("Any key closes this window.", "\033[2m")])
+    sys.stdout.write("\a")
+    sys.stdout.flush()
+    key(600)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

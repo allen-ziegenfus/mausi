@@ -1,0 +1,159 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""Tap the dbus session bus and log every desktop notification as JSONL.
+
+Writes one JSON object per notification to the log (config [notifications]
+log; by default ~/.local/state/mausi/notifications.jsonl), so the dashboard and
+Claude sessions can read it. Linux only. Captures notifications from ALL apps
+(Slack, mail, calendar, the PR monitor, etc.). mausi-dash starts it when
+[notifications] capture is on; it runs until logout.
+
+Each record carries the notification server's id for it ("id"), taken from the
+reply to Notify, so mausi-dash can close the desktop notification
+(org.freedesktop.Notifications.CloseNotification) when it is dismissed there.
+"""
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import mausi_common as cfg  # noqa: E402
+
+LOG = cfg.data_path("notifications", "log", "notifications.jsonl")
+os.makedirs(os.path.dirname(LOG), exist_ok=True)
+MATCH = "interface='org.freedesktop.Notifications',member='Notify'"
+# The server's replies, which carry the new notification's id.
+REPLIES = "type='method_return',sender='org.freedesktop.Notifications'"
+# "method call … sender=:1.473 -> … serial=3 …" / "method return … -> destination=:1.473 … reply_serial=3"
+CALL_RE = re.compile(r"sender=(\S+) -> .* serial=(\d+) ")
+RETURN_RE = re.compile(r"-> destination=(\S+) serial=\d+ reply_serial=(\d+)")
+
+# Arg order of org.freedesktop.Notifications.Notify:
+#   0 string app_name, uint32 replaces_id, 1 string app_icon,
+#   2 string summary, 3 string body, array actions, array hints, int32 timeout
+# So the top-level `string` values are [app, icon, summary, body].
+#
+# dbus-monitor prints each top-level argument at a three-space indent, and a
+# string containing newlines continues on the following lines verbatim.
+# Chromium bodies do ("<a href=…>mail.google.com</a>\n\nmessage"), so
+# arguments are split on that indent rather than read one line each — reading
+# line by line lost every Chromium body and picked up the "default" action.
+ARG_RE = re.compile(r"^   (string|uint32|int32|array|boolean|byte|double|variant) ?(.*)$")
+
+
+def record(strings):
+    if len(strings) < 4:
+        return None
+    return {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "app": strings[0],
+        "summary": strings[2],
+        "body": strings[3],
+    }
+
+
+LOG_MAX = 20 << 20  # then the log moves to <log>.1 (replacing the one before) and starts over
+
+
+def emit(rec):
+    line = json.dumps(rec, ensure_ascii=False)
+    try:
+        if os.path.getsize(LOG) > LOG_MAX:
+            os.replace(LOG, LOG + ".1")
+    except OSError:
+        pass
+    with open(LOG, "a") as f:
+        f.write(line + "\n")
+    print(line, flush=True)
+
+
+def main():
+    # `stdbuf -oL` forces dbus-monitor to line-buffer; without it, its stdout is
+    # block-buffered when piped and notifications sit unflushed for a long time.
+    proc = subprocess.Popen(
+        ["stdbuf", "-oL", "dbus-monitor", "--session", MATCH, REPLIES],
+        stdout=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        _read(proc)
+    finally:
+        proc.terminate()  # don't leave dbus-monitor behind
+
+
+def _read(proc):
+    in_notify = False
+    call = None  # (sender, serial) of the Notify being read
+    args = []  # [type, text] per top-level argument of the current Notify
+    # Notify records waiting for the server's reply with their id, by
+    # (caller, serial); written without an id if no reply comes within 2s.
+    pending = {}
+    reply = None  # (caller, serial) of a reply to one of them, until its uint32
+
+    def flush():
+        strings = []
+        for kind, text in args:
+            if kind == "string":
+                # string "…" — the quotes wrap the whole (possibly multi-line) value
+                strings.append(text[1:-1] if text.startswith('"') and text.endswith('"') else text)
+        rec = record(strings)
+        if rec and call:
+            pending[call] = (time.time(), rec)
+        elif rec:
+            emit(rec)
+
+    def expire():
+        for key, (at, rec) in list(pending.items()):
+            if time.time() - at > 2:
+                emit(pending.pop(key)[1])
+
+    for raw in proc.stdout:
+        line = raw.rstrip("\n")
+        if line.startswith(("method call", "method return", "signal", "error")):
+            if in_notify:
+                flush()
+            expire()
+            in_notify = line.startswith("method call") and "member=Notify" in line
+            m = CALL_RE.search(line) if in_notify else None
+            call = (m.group(1), m.group(2)) if m else None
+            r = RETURN_RE.search(line) if line.startswith("method return") else None
+            reply = (r.group(1), r.group(2)) if r and (r.group(1), r.group(2)) in pending else None
+            args = []
+            continue
+        if reply:
+            m = ARG_RE.match(line)
+            if m and m.group(1) == "uint32":
+                rec = pending.pop(reply)[1]
+                rec["id"] = int(m.group(2))
+                emit(rec)
+            reply = None
+            continue
+        if not in_notify:
+            continue
+        m = ARG_RE.match(line)
+        if m:
+            args.append([m.group(1), m.group(2)])
+        elif args:
+            args[-1][1] += "\n" + line
+    if in_notify:
+        flush()
+    for _, rec in pending.values():
+        emit(rec)
+
+
+if __name__ == "__main__":
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: sys.exit(0))
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)

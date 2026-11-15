@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Claude Code hooks for mausi (registered by the mausi plugin, hooks/hooks.json):
+#
+#   mausi-hook notify   # Notification: desktop notification + ⏳ on the tab
+#   mausi-hook clear    # PreToolUse / UserPromptSubmit / Stop: take both away
+#
+# The notification goes through kitty's desktop-notification protocol (OSC 99,
+# the same one `kitten notify` speaks), written to the terminal of the Claude
+# process that fired the hook. So it works the same on Linux and macOS,
+# clicking it focuses the kitty window the session runs in, and a repeat for
+# the same session updates one notification instead of stacking new ones.
+#
+# Payload fields used: message, cwd, transcript_path, session_id.
+# No-op outside kitty. Never fails: a hook error would only get in the way.
+set -u
+
+[[ -n "${KITTY_WINDOW_ID:-}" ]] || { cat >/dev/null; exit 0; }
+
+here=$(dirname "$(realpath "$0")")
+state="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/mausi-notify"
+
+data=$(cat)
+field() { printf '%s' "$data" | jq -r ".$1 // \"\"" 2>/dev/null; }
+session_id=$(field session_id)
+session_id=${session_id:-default}
+
+# The terminal of the Claude process: the hook's nearest ancestor with a tty.
+claude_tty() {
+	local pid=$PPID tty
+	for _ in 1 2 3 4; do
+		tty=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
+		if [[ -n "$tty" && "$tty" != "?" && "$tty" != "??" ]]; then
+			printf '/dev/%s' "$tty"
+			return 0
+		fi
+		pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+		[[ -n "$pid" && "$pid" != 1 ]] || return 1
+	done
+	return 1
+}
+
+send() {  # send <kitten notify args...>; quietly does nothing without a tty
+	local tty
+	tty=$(claude_tty) || return 0
+	[[ -w "$tty" ]] || return 0
+	kitten notify --only-print-escape-code "$@" >"$tty" 2>/dev/null
+}
+
+case "${1:-}" in
+	notify)
+		message=$(field message)
+		cwd=$(field cwd)
+		transcript=$(field transcript_path)
+		project=$(basename "${cwd:-session}")
+
+		# What Claude was about to do: the last tool call in the transcript.
+		context=""
+		if [[ -n "$transcript" && -r "$transcript" ]]; then
+			context=$(tail -n 200 "$transcript" | jq -r '
+				select(.type == "assistant") | .message.content[]? | select(.type == "tool_use")
+				| .name + ": " + ((.input.description // .input.file_path // .input.command
+					// .input.url // .input.query // .input.skill // "") | tostring)
+				# Notifications are shown and logged: leave tokens and passwords out.
+				| gsub("(?<a>(?i:bearer|token|passw(?:or)?d|secret|api[_-]?key|auth)[=: ]+)[^\\s\"'"'"'&;]+"; "\(.a)…")
+				| gsub("(?<a>[?&][^=\\s&]+=)[^&\\s\"'"'"';]+"; "\(.a)…")
+				| gsub("(?<a>--user[= ])\\S+"; "\(.a)…")
+				| gsub("[A-Za-z0-9_+/=-]{32,}"; "…")' 2>/dev/null |
+				tail -1 | tr '\n' ' ' | cut -c1-140)
+			context=${context%: }
+		fi
+
+		tab=$(kitty @ ls 2>/dev/null | jq -r --argjson w "$KITTY_WINDOW_ID" '
+			.[] | .tabs | to_entries[] | select(any(.value.windows[]; .id == $w)) | .key + 1' | head -1)
+
+		case "$message" in
+			*ermission*) glyph="⏳" urgency=critical ;;
+			*) glyph="💬" urgency=normal ;;
+		esac
+
+		title="$glyph ${tab:+$tab · }$project"
+		body="${context:+$context
+}${message:-needs your attention}"
+
+		send --app-name "Claude Code" --identifier "mausi-$session_id" --urgency "$urgency" "$title" "$body"
+		mkdir -p "$state" && touch "$state/$session_id"
+		"$here/mausi-mark" mark
+		;;
+	clear)
+		"$here/mausi-mark" clear
+		if [[ -e "$state/$session_id" ]]; then
+			rm -f "$state/$session_id"
+			send --identifier "mausi-$session_id"
+		fi
+		;;
+esac
+exit 0

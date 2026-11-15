@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Log when I'm at the computer: one "<epoch> active|idle" line per change, for
+# mausi-dash's You section. mausi-dash starts it in the background when it
+# isn't running (one instance, via mausi-activity.pid); it keeps going until logout.
+#
+# Linux: swayidle uses the Wayland ext-idle-notify protocol, which COSMIC implements:
+# "idle" after IDLE_TIMEOUT seconds without keyboard/mouse input, "resumed" on
+# the next input. The idle line is backdated by the timeout, so the time spent
+# waiting for it doesn't count as active. Apps can inhibit idle (a Google Meet tab
+# in Chromium does), so a meeting counts as active, which is what I want.
+#
+# macOS: the keyboard/mouse idle time (IOHIDSystem's HIDIdleTime) is polled
+# every POLL seconds, with the same timeout and backdating. Call detection is
+# Linux-only for now.
+#
+# Calls: every MIC_POLL seconds the microphone is checked; while any app records
+# from a real input (not a .monitor of an output, not a volume meter) a
+# "call-start" ... "call-end" span is logged — Meet, Zoom, huddles keep the mic
+# stream open even when muted. The dashboard counts those spans as active.
+#
+#   mausi-activity              # run (in the foreground; exits if one already runs)
+#   mausi-activity --tail       # follow the log, with readable times
+#   mausi-activity --mark <active|idle> [seconds ago]   # (swayidle's callback)
+#   mausi-activity --mic        # exit 0 if the mic is in use now (a call)
+set -uo pipefail
+
+IDLE_TIMEOUT=120
+MIC_POLL=30
+log="${XDG_STATE_HOME:-${HOME}/.local/state}/mausi/activity.log"
+pidfile="$(dirname "$log")/mausi-activity.pid"
+POLL=10
+
+if [[ "${1:-}" == --tail ]]; then
+	tail -n 20 -F "$log" | while read -r when state; do
+		if [[ "$(uname)" == Darwin ]]; then
+			echo "$(date -r "${when}" '+%a %H:%M:%S') ${state}"
+		else
+			echo "$(date -d "@${when}" '+%a %H:%M:%S') ${state}"
+		fi
+	done
+
+	exit 0
+fi
+
+mark() {
+	echo "$(( $(date +%s) - ${2:-0} )) $1" >> "$log"
+}
+
+mkdir -p "$(dirname "$log")"
+
+# swayidle runs its commands through sh -c, so they call back into this script.
+if [[ "${1:-}" == --mark ]]; then
+	mark "$2" "${3:-0}"
+
+	exit 0
+fi
+
+self="$(realpath "$0")"
+call_flag="${XDG_RUNTIME_DIR:-/tmp}/mausi-call"
+
+function mic_in_use {
+	local monitors
+
+	monitors=$(pactl -f json list sources 2>/dev/null | jq -c '[.[] | select(.name | endswith(".monitor")) | .index]')
+
+	pactl -f json list source-outputs 2>/dev/null | jq -e --argjson m "${monitors:-[]}" '
+		any(.[]; .corked == false
+			and (.source as $s | any($m[]; . == $s) | not)
+			and ((.properties["application.process.binary"] // "") | test("pavucontrol|cosmic") | not))' >/dev/null
+}
+
+function watch_mic {
+	while true; do
+		if mic_in_use; then
+			if [[ ! -e "$call_flag" ]]; then
+				mark call-start
+				touch "$call_flag"
+			fi
+		elif [[ -e "$call_flag" ]]; then
+			mark call-end
+			rm -f "$call_flag"
+		fi
+
+		sleep "$MIC_POLL"
+	done
+}
+
+function stop {
+	mark idle
+	kill $(jobs -p) 2>/dev/null  # swayidle and the mic watcher
+	rm -f "$pidfile"
+
+	if [[ -e "$call_flag" ]]; then
+		mark call-end
+		rm -f "$call_flag"
+	fi
+
+	exit 0
+}
+
+if [[ "${1:-}" == --mic ]]; then
+	mic_in_use
+	exit $?
+fi
+
+# One instance: another one that is still running wins. The dashboard writes
+# this process's own pid here when it starts it, so that one doesn't count.
+other=$(cat "$pidfile" 2>/dev/null)
+if [[ -n "$other" && "$other" != "$$" ]] && ps -o args= -p "$other" 2>/dev/null | grep -q mausi-activity; then
+	exit 0
+fi
+
+echo $$ > "$pidfile"
+
+trap stop TERM INT HUP
+
+rm -f "$call_flag"
+
+if [[ "$(uname)" == Darwin ]]; then
+	mark active
+	state=active
+
+	while true; do
+		idle=$(ioreg -c IOHIDSystem | awk '/HIDIdleTime/ {print int($NF / 1000000000); exit}')
+
+		if [[ "$state" == active && "${idle:-0}" -ge "$IDLE_TIMEOUT" ]]; then
+			mark idle "$idle"
+			state=idle
+		elif [[ "$state" == idle && "${idle:-0}" -lt "$IDLE_TIMEOUT" ]]; then
+			mark active "$idle"
+			state=active
+		fi
+
+		sleep "$POLL" &
+		wait $!
+	done
+fi
+
+watch_mic &
+
+mark active
+
+swayidle -w \
+	timeout "$IDLE_TIMEOUT" "'${self}' --mark idle ${IDLE_TIMEOUT}" resume "'${self}' --mark active" \
+	before-sleep "'${self}' --mark idle" after-resume "'${self}' --mark active" &
+
+wait $!

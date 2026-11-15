@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Put a ⏳ on the current kitty tab while its
+# Claude session is waiting on you, and take it off again. Called from the
+# Claude Code hooks (mausi-hook). No-op outside kitty.
+#
+# The waiting state also goes into the window's user var claude_wait, which is
+# what mausi-picker and mausi-dash read.
+#
+# `clear` runs on every PreToolUse, so it returns straight away unless `mark`
+# left a flag file — no remote-control round trips on the hot path.
+[[ -n "${KITTY_WINDOW_ID:-}" && -n "${KITTY_LISTEN_ON:-}" ]] || exit 0
+
+match="id:${KITTY_WINDOW_ID}"
+tab="window_id:${KITTY_WINDOW_ID}"  # set-tab-title matches tabs: id: would be a tab id
+flag="${XDG_RUNTIME_DIR:-/tmp}/mausi-notify/kitty-marked/${KITTY_WINDOW_ID}"
+
+[[ "${1:-}" == clear && ! -e "$flag" ]] && exit 0
+
+# Base title: the one mausi recorded, else whatever the tab shows now
+# minus any marker we left on it earlier.
+# own=1 when mausi named the tab (claude_title); else the tab follows its window's
+# title, and clearing hands it back to that rather than freezing it.
+read -r own base < <(kitty @ ls 2>/dev/null | jq -r --argjson w "$KITTY_WINDOW_ID" '
+	.[].tabs[] | select(any(.windows[]; .id == $w)) as $t
+	| ($t.windows[] | select(.id == $w) | .user_vars.claude_title) as $c
+	| (if $c then "1 " + $c else "0 " + $t.title end)' | head -1)
+base="${base#⏳ }"
+
+case "${1:-}" in
+	mark)
+		mkdir -p "${flag%/*}"
+		touch "$flag"
+		kitty @ set-user-vars --match "$match" claude_wait=1 >/dev/null 2>&1
+		[[ -n "$base" ]] && kitty @ set-tab-title --match "$tab" "⏳ $base" >/dev/null 2>&1
+		;;
+	clear)
+		rm -f "$flag"
+		kitty @ set-user-vars --match "$match" claude_wait >/dev/null 2>&1
+		if [[ "$own" == 1 ]]; then
+			kitty @ set-tab-title --match "$tab" "$base" >/dev/null 2>&1
+		else
+			kitty @ set-tab-title --match "$tab" "" >/dev/null 2>&1  # back to following the window title
+		fi
+		;;
+esac
+exit 0

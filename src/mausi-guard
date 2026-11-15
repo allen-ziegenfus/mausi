@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""UserPromptSubmit hook: let a Claude session object when a prompt is about a
+different task than the one the session belongs to.
+
+mausi-dash writes ~/.cache/mausi/task-index.json: the tasks.md
+tasks with their Jira keys and PR refs, Jira parents, and which task each
+running session is linked to (attached with A, or from its first prompts). If
+this session has a task and the prompt names Jira keys or PRs that belong only
+to other tasks, the hook adds context asking Claude to point that out before
+doing the work. Each other task is raised once per session (state in
+~/.cache/mausi/task-guard.json), so saying "that's fine" sticks.
+
+Never blocks and never fails: any problem just means no context is added.
+"""
+import json
+import os
+import re
+import sys
+import tempfile
+
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "mausi")  # as mausi_common.CACHE_DIR (run with -I, so no import)
+INDEX = os.path.join(CACHE, "task-index.json")
+STATE = os.path.join(CACHE, "task-guard.json")
+RELATED_MAX = 3  # as mausi_taskview.py: a key in more tasks than this means nothing
+KEY_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
+PR_URL_RE = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
+PR_REF_RE = re.compile(r"\b([\w.-]+/[\w.-]+)#(\d+)\b")
+
+
+def load(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def owners(index, keys, refs, parents=True):
+    """Task titles for keys/refs, with the same precedence as the task view:
+    PR refs, then main keys, then related keys, then the keys' Jira parents."""
+    tasks = index.get("tasks", [])
+    found = {t["title"] for t in tasks if refs & set(t.get("refs", []))}
+    if not found:
+        found = {t["title"] for t in tasks if t.get("main") in keys or (t.get("id") and t["id"] in keys)}
+    if not found:
+        for k in keys:
+            having = [t["title"] for t in tasks if k in t.get("keys", [])]
+            if len(having) <= RELATED_MAX:
+                found |= set(having)
+    if not found and parents:
+        up = {index.get("parents", {}).get(k) for k in keys} - {None}
+        if up:
+            return owners(index, up, set(), parents=False)
+    return found
+
+
+def main():
+    event = json.load(sys.stdin)
+    sid, prompt = event.get("session_id", ""), event.get("prompt", "")
+    index = load(INDEX)
+    mine = index.get("sessions", {}).get(sid)
+    if not mine or not prompt:
+        return
+    keys = set(KEY_RE.findall(prompt))
+    refs = {f"{o}/{r}#{n}" for o, r, n in PR_URL_RE.findall(prompt)} | \
+        {f"{repo}#{n}" for repo, n in PR_REF_RE.findall(prompt)}
+    if not keys and not refs:
+        return
+    others = owners(index, keys, refs)
+    if not others or mine in others:
+        return
+    state = load(STATE)
+    raised = set(state.get(sid, []))
+    new = sorted(others - raised)
+    if not new:
+        return
+    state[sid] = sorted(raised | set(new))
+    os.makedirs(CACHE, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=CACHE, prefix=".guard.", suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, STATE)
+    named = ", ".join(sorted(keys | refs))
+    context = (
+        f"[mausi task guard] This session belongs to the task “{mine}” (from ~/.claude/tasks.md, "
+        f"linked in the mausi dashboard). The user's message refers to {named}, which belongs to "
+        + ("the task " if len(new) == 1 else "the tasks ") + ", ".join(f"“{t}”" for t in new)
+        + ". Before working on it, briefly point out that this mixes tasks and ask whether to continue here or "
+        "start a separate session for that task (in the dashboard's task view: select the task and press c). "
+        "If the user says it's intentional, go ahead and don't raise it again. If it's only a passing reference, "
+        "just continue."
+    )
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:  # noqa: BLE001 — a hook must never get in the way
+        pass
+    sys.exit(0)

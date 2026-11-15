@@ -1,0 +1,7 @@
+{
+  "name": "mausi",
+  "description": "Claude Code side of mausi: notifications that focus the session's kitty tab, a ⏳ on tabs waiting for you, a guard against mixing up tasks, and the task-store skill.",
+  "author": { "name": "Allen Ziegenfus" },
+  "homepage": "https://github.com/allen-ziegenfus/mausi",
+  "license": "MIT"
+}
