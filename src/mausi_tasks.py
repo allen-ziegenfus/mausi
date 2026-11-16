@@ -16,6 +16,7 @@ TASK.md is a YAML header and the task's notes:
     done: null              # the date it was marked done
     pinned_from: null       # the section it came from while pinned to Now
     keywords: [cx, scaling] # optional: search words not in the text (tasks tag / tasks find)
+    watch: [PROJ-123]       # optional: tickets/PRs the task waits on, checked at session start (tasks watch)
     repos: [~/src/foo]      # optional: other folders (repos) that belong to the task, linked into code/
     extra_hours: 1.5        # optional: time spent outside Claude (tasks spent)
     effort: {...}           # optional: the effort, frozen when the task is done
@@ -249,7 +250,7 @@ def nudge(t, step):
 def _text(t):
     header = {k: t.get(k) for k in ("id", "title", "summary", "section", "order", "status", "added", "done",
                                      "pinned_from")}
-    header.update({k: t[k] for k in ("keywords", "repos", "extra_hours", "effort") if t.get(k)})
+    header.update({k: t[k] for k in ("keywords", "watch", "repos", "extra_hours", "effort") if t.get(k)})
     body = "\n".join(t.get("notes", [])).rstrip("\n")
     return "---\n" + yaml.safe_dump(header, sort_keys=False, allow_unicode=True, width=1000) + "---\n" + \
         (body + "\n" if body else "")
@@ -262,6 +263,15 @@ def set_keywords(t, words, remove=False):
     t["keywords"] = sorted(current - words if remove else current | words)
     save(t, f"{t['id']}: keywords {' '.join(t['keywords']) or '(none)'}")
     return t["keywords"]
+
+
+def set_watch(t, refs, remove=False):
+    """Add (or remove) what the task waits on: ticket keys or PR URLs, in the order given, no duplicates."""
+    current = list(t.get("watch") or [])
+    refs = [r.strip() for r in refs if r.strip()]
+    t["watch"] = [r for r in current if r not in refs] if remove else current + [r for r in refs if r not in current]
+    save(t, f"{t['id']}: watch {' '.join(t['watch']) or '(none)'}")
+    return t["watch"]
 
 
 SEARCH_SKIP = {"scratch", "code"}  # git-ignored scratch files, links to worktrees
@@ -818,7 +828,8 @@ def _render(message=None):
             out += [sec["note"], ""]
         for t in members:
             out += [f"- [ ] **{t['title']}**" + (f" {t['summary']}" if t.get("summary") else ""),
-                    f"  - ID: {t['id']}"] + ["  " + l if l.strip() else "" for l in t.get("notes", [])] + [""]
+                    f"  - ID: {t['id']}"] + \
+                   ([f"  - Watch: {', '.join(t['watch'])}"] if t.get("watch") else []) + ["  " + l if l.strip() else "" for l in t.get("notes", [])] + [""]
         if sec.get("note") and sec.get("note_after"):
             out += ["", sec["note"]]
     stray = [t for t in open_tasks if t.get("section") not in {s["heading"] for s in sections()}]

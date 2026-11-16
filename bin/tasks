@@ -13,6 +13,7 @@
     tasks path T-12               # the task's folder (cd "$(tasks path T-12)")
     tasks find scaling cx [-o]     # tasks matching all words: keywords, title, notes, files (-o: open only)
     tasks tag T-12 cx scaling [-r]   # add (-r: remove) search keywords; no words: show them
+    tasks watch [T-12 PROJ-123 [-r]]   # what a task waits on (-r: remove); no task: all watched open tasks
     tasks sync                     # regenerate the overview after editing TASK.md files
     tasks effort [T-12]           # time spent (from my messages in its Claude sessions) and timespan
     tasks spent T-12 1.5 [note]   # add time spent outside Claude, in hours
@@ -173,6 +174,10 @@ def main():
     tag.add_argument("task")
     tag.add_argument("words", nargs="*")
     tag.add_argument("-r", "--remove", action="store_true")
+    watch = sub.add_parser("watch")
+    watch.add_argument("task", nargs="?")
+    watch.add_argument("refs", nargs="*")
+    watch.add_argument("-r", "--remove", action="store_true")
     effort = sub.add_parser("effort")
     effort.add_argument("task", nargs="?")
     effort.add_argument("-a", "--all", action="store_true", help="done tasks too")
@@ -213,6 +218,16 @@ def main():
         words = [w for arg in args.words for w in re.split(r"[,\s]+", arg) if w]
         kw = store.set_keywords(t, words, args.remove) if words else (t.get("keywords") or [])
         print(f"{t['id']}: {', '.join(kw) or '(no keywords)'}")
+    elif args.cmd == "watch":
+        if args.task:
+            t = need(args.task)
+            refs = [r for arg in args.refs for r in re.split(r"[,\s]+", arg) if r]
+            w = store.set_watch(t, refs, args.remove) if refs else (t.get("watch") or [])
+            print(f"{t['id']}: {', '.join(w) or '(not watching anything)'}")
+        else:
+            for t in store.load_all():
+                if t.get("status") == "open" and t.get("watch"):
+                    print(f"{t['id']}\t{' '.join(t['watch'])}\t{t['title']}")
     elif args.cmd == "sync":
         print("regenerated" if store.sync() else "already up to date")
     elif args.cmd == "effort":
