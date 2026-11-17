@@ -99,9 +99,6 @@ TICKET_RE = re.compile(r"^([A-Z][A-Z0-9]+-\d+)")
 TICKET_ANY_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")  # a Jira key anywhere in the text
 
 SESSION_REFRESH = 2
-INFRA_REFRESH = 15
-WORK_REFRESH = 60
-MEETINGS_REFRESH = 120
 BOARD_URL = cfg.get("board", "url").rstrip("/")  # "" = no PR/Jira sections
 JIRA_SITE = cfg.get("jira", "site").rstrip("/")
 JIRA_BROWSE = f"{JIRA_SITE}/browse/" if JIRA_SITE else "https://jira.invalid/browse/"
@@ -255,33 +252,22 @@ def transcript_seconds(cwd, sid):
         return float("inf")
 
 
-def transcript_age(cwd, sid):
-    proj = os.path.join(PROJECTS, re.sub(r"[^A-Za-z0-9]", "-", cwd))
-    if sid:
-        path = os.path.join(proj, sid + ".jsonl")
-    else:
-        try:
-            path = max(
-                (os.path.join(proj, f) for f in os.listdir(proj)
-                 if f.endswith(".jsonl")),
-                key=os.path.getmtime)
-        except (OSError, ValueError):
-            return ""
-    try:
-        age = time.time() - os.path.getmtime(path)
-    except OSError:
+def transcript_age(seconds):
+    """A transcript_seconds() value as "now", "5m", "3h", "2d" ("" if unknown)."""
+    if seconds == float("inf"):
         return ""
-    if age < 60:
+    if seconds < 60:
         return "now"
-    if age < 3600:
-        return f"{int(age // 60)}m"
-    if age < 86400:
-        return f"{int(age // 3600)}h"
-    return f"{int(age // 86400)}d"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
 
 
 def sessions():
     rows = []
+    background = snapshots.background_tasks()
     for os_window in kitty_ls():
         for index, tab in enumerate(os_window.get("tabs", []), 1):
             for window in tab.get("windows", []):
@@ -291,6 +277,7 @@ def sessions():
                 branch = git_branch(cwd)
                 match = TICKET_RE.match(branch)
                 sid = session_id(window)
+                seconds = transcript_seconds(cwd, sid)
                 rows.append({
                     "tab": index,
                     "tab_id": tab["id"],
@@ -301,16 +288,23 @@ def sessions():
                     # Set by the hooks between your prompt and Claude's Stop. Esc
                     # skips Stop, so trust it only while the transcript is moving.
                     "busy": (window.get("user_vars", {}).get("claude_busy") == "1"
-                             and transcript_seconds(cwd, sid) < BUSY_STALE),
+                             and seconds < BUSY_STALE),
+                    "bg": background.get(sid, 0),
+                    "window_id": window["id"],
+                    "tab_title": tab.get("title", ""),
                     "ticket": match.group(1) if match else "",
                     "branch": branch,
                     "cwd": cwd.replace(HOME, "~", 1),
                     "sid": sid[:8],
                     "sid_full": sid,
                     "cwd_full": cwd,
-                    "age": transcript_age(cwd, sid),
+                    "age": transcript_age(seconds),
                 })
                 break
+    try:
+        sync_tab_marks(rows)
+    except Exception:  # noqa: BLE001 — marks are cosmetic; the list must still draw
+        cfg.log_error("sync_tab_marks")
     rows += outside_sessions({r["sid_full"] for r in rows})
     return rows
 
@@ -332,7 +326,7 @@ def outside_sessions(in_kitty):
             "title": os.path.basename(cwd), "task_var": "", "active": False, "wait": False,
             "ticket": "", "branch": git_branch(cwd),
             "cwd": cwd.replace(HOME, "~", 1), "sid": sid[:8], "sid_full": sid, "cwd_full": cwd,
-            "age": transcript_age(cwd, sid),
+            "age": transcript_age(transcript_seconds(cwd, sid)),
         })
     return rows
 
@@ -1908,16 +1902,50 @@ def meeting_lines(detail=False):
     return lines
 
 
+TAB_MARKS = ("⏳", "▶", "▷")
+_mark_pending = {}  # window id -> the mark a scan found missing; set when the next scan agrees
+
+
+def sync_tab_marks(rows):
+    """Put each Claude tab's title mark right where no hook can: ▷ while an
+    idle session has background jobs (no hook fires when they end), and no ▶
+    once a turn ended without Stop (Esc). ⏳ and a live ▶ are the hooks'.
+    A mismatch is fixed only when two scans in a row see it, so a hook that
+    is changing the tab at that moment wins."""
+    mark_cmd = os.path.join(os.path.dirname(os.path.realpath(__file__)), "mausi-mark")
+    seen = set()
+    for r in rows:
+        if not r.get("window_id"):
+            continue
+        seen.add(r["window_id"])
+        want = "⏳" if r["wait"] else "▶" if r["busy"] else "▷" if r["bg"] else ""
+        have = next((m for m in TAB_MARKS if r["tab_title"].startswith(m + " ")), "")
+        if want == have or want in ("⏳", "▶"):
+            _mark_pending.pop(r["window_id"], None)
+            continue
+        if _mark_pending.get(r["window_id"]) != want:
+            _mark_pending[r["window_id"]] = want
+            continue
+        _mark_pending.pop(r["window_id"], None)
+        env = dict(os.environ, KITTY_WINDOW_ID=str(r["window_id"]))
+        subprocess.Popen([mark_cmd, "bg" if want == "▷" else "idle"], env=env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for gone in set(_mark_pending) - seen:
+        _mark_pending.pop(gone, None)
+
+
 def session_lines(rows, detail=False):
     waiting = sum(1 for r in rows if r["wait"])
     working = sum(1 for r in rows if r.get("busy") and not r["wait"])
+    background = sum(1 for r in rows if r.get("bg") and not r.get("busy") and not r["wait"])
     lines = [(f"{BOLD}Sessions{RESET} {DIM}({len(rows)}){RESET}"
               + (f"  {YELLOW}⏳ {waiting} waiting on you{RESET}" if waiting else "")
-              + (f"  {GREEN}▶ {working} working{RESET}" if working else ""), None)]
+              + (f"  {GREEN}▶ {working} working{RESET}" if working else "")
+              + (f"  {GREEN}▷ {background} in the background{RESET}" if background else ""), None)]
     for r in rows:
-        # ⏳ waiting on you > ▶ Claude working > › the tab you're on
+        # ⏳ waiting on you > ▶ Claude working > ▷ background jobs > › the tab you're on
         mark = (f"{YELLOW}⏳{RESET}" if r["wait"] else f"{GREEN}▶{RESET}" if r.get("busy")
-                else f"{CYAN}›{RESET}" if r["active"] else " ")
+                else f"{GREEN}▷{RESET}" if r.get("bg") else f"{CYAN}›{RESET}" if r["active"] else " ")
         # Pad before colouring so the escape codes don't eat the column width.
         ticket = f"{r['ticket']:<11}" if r["ticket"] else f"{DIM}{'—':<11}{RESET}"
         summary = jira.get(r["ticket"], "")
@@ -2002,21 +2030,6 @@ def fit(s, width):
     """clip, then pad with spaces to exactly width cells."""
     s = clip(s, width)
     return s + RESET + " " * max(0, width - visible_len(s))
-
-
-def tail(path, size=65536):  # last `size` bytes, as lines
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            start = max(0, f.tell() - size)
-            f.seek(start)
-            lines = f.read().decode(errors="ignore").splitlines()
-            return lines[1:] if start else lines  # mid-file, the first line is cut
-    except OSError:
-        return []
-
-
-notification_source = context.notification_source
 
 
 def load_dismissed():
@@ -2920,12 +2933,14 @@ def on_context(name, entry):
     global work_data, infra_data, mail, meetings, meetings_tomorrow
     data, error = entry.get("data"), entry.get("error")
     with lock:
+        # An error shows as before, in place of the section; the collector
+        # keeps the last good data in the file for triage.
         if name == "board":
-            work_data = data if data is not None else {"error": error or "no data"}
+            work_data = {"error": error} if error or data is None else data
         elif name == "infra":
             infra_data = data
         elif name == "mail":
-            mail = dict(data or {"unread": []}, error=error if data is None else None)
+            mail = {"unread": [], "error": error} if error or data is None else dict(data, error=None)
         elif name == "calendar":
             today = (data or {}).get("today") or {"events": [], "synced": None}
             meetings = dict(today, error=error if not today.get("events") and error else None)

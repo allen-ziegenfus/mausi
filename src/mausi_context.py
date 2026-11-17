@@ -14,7 +14,7 @@ Whoever holds the lock on CONTEXT + ".lock" is the collector:
                                             # the file
     ctx.get("board")                        # {"at", "error", "data"} or None
     ctx.refresh("board", hard=True)         # fetch now (hard: the board drops
-                                            # its caches too)
+                                            # its caches too); None: all but triage
 
 `mausi context --watch` runs a collector on its own (a service, or for the Go
 port); a dashboard started next to it only reads.
@@ -25,7 +25,6 @@ import json
 import os
 import re
 import shlex
-import signal
 import subprocess
 import threading
 import time
@@ -361,23 +360,26 @@ class Context:
             cfg.log_error(f"context on_update {name}")
 
     def refresh(self, name=None, hard=False):
-        """Fetch a source (all of them for None) now."""
-        names = list(SOURCES) if name is None else [name]
+        """Fetch a source now; None: all of them except triage (a paid model
+        call, run only when asked for by name)."""
+        names = [n for n in SOURCES if n != "triage"] if name is None else [name]
         if self.collecting:
-            for n in names:
-                if hard:
-                    self.hard.add(n)
-                self.wakes[n].set()
+            self._wake(names, hard)
             return
-        # A follower: ask the collector.
+        # A follower: leave the request for the collector, which polls for it.
         try:
             with open(REFRESH_REQ, "a") as f:
                 f.write("".join(f"{n}{' hard' if hard else ''}\n" for n in names))
-            pid = (read() or {}).get("collector")
-            if pid:
-                os.kill(int(pid), signal.SIGUSR1)
-        except (OSError, ValueError):
+        except OSError:
             pass
+
+    def _wake(self, names, hard):
+        for n in names:
+            if n in self.wakes:
+                if hard:
+                    with self.lock:
+                        self.hard.add(n)
+                self.wakes[n].set()
 
     # -- starting --
     def start(self):
@@ -407,11 +409,6 @@ class Context:
             for name, entry in (old.get("sources") or {}).items():
                 if name in SOURCES and SOURCES[name][2]:
                     self._set(name, dict(entry, stale=True))
-        if threading.current_thread() is threading.main_thread():
-            try:
-                signal.signal(signal.SIGUSR1, lambda *_: self._read_requests())
-            except ValueError:
-                pass
         for name, (fetch, every, enabled) in SOURCES.items():
             if enabled:
                 threading.Thread(target=self._loop, args=(name, fetch, every), daemon=True).start()
@@ -419,32 +416,47 @@ class Context:
         threading.Thread(target=self._poll_requests, daemon=True).start()
 
     # -- collecting --
+    def _fresh(self):
+        """Whether every other source has fetched since this collector started."""
+        with self.lock:
+            return all(n in self.state and not self.state[n].get("stale")
+                       for n, (_, _, on) in SOURCES.items() if on and n != "triage")
+
+    def _put(self, name, data, error):
+        """Store a fetch; write the file only when something changed (or a
+        source's time is 5 minutes behind), not on every unchanged poll."""
+        prev = self.get(name) or {}
+        if data is None and prev.get("data") is not None:
+            data = prev["data"]  # keep the last good data, with the error
+        changed = prev.get("data") != data or prev.get("error") != error or prev.get("stale")
+        now = time.time()
+        if changed or now - prev.get("at", 0) > 300:
+            self._set(name, {"at": now, "error": error, "data": data})
+            self._dirty.set()
+
     def _loop(self, name, fetch, every):
+        if name == "triage":
+            # Not over the last collector's leftovers: wait for fresh data.
+            for _ in range(120):
+                if self._fresh():
+                    break
+                time.sleep(1)
         last_stamp = None
         while True:
-            hard = name in self.hard
-            self.hard.discard(name)
+            with self.lock:
+                hard = name in self.hard
+                self.hard.discard(name)
             try:
                 if name == "notifications":
                     stamp = notifications_changed()
                     if stamp != last_stamp or hard:
                         last_stamp = stamp
-                        data, error = fetch(hard)
-                        self._set(name, {"at": time.time(), "error": error, "data": data})
-                        self._dirty.set()
+                        self._put(name, *fetch(hard))
                 else:
-                    data, error = fetch(hard)
-                    prev = self.get(name)
-                    if data is None and prev and prev.get("data") is not None:
-                        data = prev["data"]  # keep the last good data, with the error
-                    self._set(name, {"at": time.time(), "error": error, "data": data})
-                    self._dirty.set()
+                    self._put(name, *fetch(hard))
             except Exception as e:  # noqa: BLE001
                 cfg.log_error(f"context {name}")
-                prev = self.get(name) or {}
-                self._set(name, {"at": time.time(), "error": f"{type(e).__name__}: {e}",
-                                 "data": prev.get("data")})
-                self._dirty.set()
+                self._put(name, None, f"{type(e).__name__}: {e}")
             self.wakes[name].wait(every)
             self.wakes[name].clear()
 
@@ -461,22 +473,21 @@ class Context:
                 cfg.log_error("context write")
 
     def _read_requests(self):
+        # Move the file aside first: a request appended while we read goes
+        # into a new file instead of being deleted unread.
+        taken = f"{REFRESH_REQ}.{os.getpid()}"
         try:
-            with open(REFRESH_REQ) as f:
+            os.rename(REFRESH_REQ, taken)
+            with open(taken) as f:
                 lines = f.read().split("\n")
-            os.unlink(REFRESH_REQ)
+            os.unlink(taken)
         except OSError:
             return
         for line in lines:
             name, _, hard = line.partition(" ")
-            if name in self.wakes:
-                if hard:
-                    self.hard.add(name)
-                self.wakes[name].set()
+            self._wake([name], bool(hard))
 
     def _poll_requests(self):
-        # The signal only reaches a collector whose main thread runs Python
-        # code often; this catches the rest within a second.
         while True:
             time.sleep(1)
             if os.path.exists(REFRESH_REQ):
@@ -495,7 +506,8 @@ class Context:
                 doc = read()
                 if doc and doc.get("version") == VERSION:
                     for name, entry in (doc.get("sources") or {}).items():
-                        if name in SOURCES and entry != self.get(name):
+                        prev = self.get(name) or {}
+                        if name in SOURCES and (entry.get("data"), entry.get("error")) != (prev.get("data"), prev.get("error")):
                             self._set(name, entry)
             if self._take_lock():  # the collector stopped: collect here
                 self._start_collecting()
@@ -526,12 +538,12 @@ def main(args):
         print(f"collecting into {CONTEXT} (Ctrl-C stops)")
         try:
             while True:
-                signal.pause()
+                time.sleep(3600)
         except KeyboardInterrupt:
             return 0
     if "--refresh" in args:
         rest = [a for a in args if a != "--refresh"]
-        Context().refresh(rest[0] if rest else None, hard=True)
+        Context().refresh(rest[0] if rest else None, hard=True)  # triage only by name
         return 0
     doc = read()
     if doc is None:

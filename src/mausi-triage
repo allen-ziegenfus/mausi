@@ -127,13 +127,18 @@ def digest(doc):
         out += [f"- {i['key']} [{i.get('status')}] {clip(i.get('summary'), 120)} · updated {str(i.get('updated', ''))[:10]}"
                 for i in jira[:25]]
 
-    mail = [m for m in (data("mail") or {}).get("unread", [])
-            if now - time.mktime(time.strptime(m["date"][:16], "%Y-%m-%dT%H:%M")) < MAIL_WINDOW]
+    def mail_age(m):
+        try:
+            return now - time.mktime(time.strptime(str(m.get("date", ""))[:16], "%Y-%m-%dT%H:%M"))
+        except ValueError:
+            return 0  # an odd date: keep the mail rather than fail the whole run
+
+    mail = [m for m in (data("mail") or {}).get("unread", []) if mail_age(m) < MAIL_WINDOW]
     if mail:
         out.append("## Unread mail, last 24h")
         for m in mail[:30]:
             tags = ", ".join(t for t, on in (("to me", m.get("to_me")), ("list", m.get("list")), ("starred", m.get("starred"))) if on)
-            out.append(f"- {m['date'][5:16].replace('T', ' ')} from {clip(m.get('from'), 50)} ({tags}): "
+            out.append(f"- {str(m.get('date', ''))[5:16].replace('T', ' ')} from {clip(m.get('from'), 50)} ({tags}): "
                        f"{clip(m.get('subject'), 140)} — {clip(m.get('body'), 200)} · {m.get('url')}")
 
     notes = data("notifications") or {}

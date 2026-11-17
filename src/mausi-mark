@@ -7,12 +7,15 @@
 #   mausi-mark clear   # no longer waiting: title back, claude_wait unset
 #   mausi-mark busy    # Claude is working: "▶ title", user var claude_busy=1
 #   mausi-mark idle    # Claude stopped: title back, claude_busy unset
+#   mausi-mark bg      # idle, but background jobs run: "▷ title", claude_bg=1
 #
 # mausi-picker and mausi-dash read the user vars.
 #
 # `clear` runs on every PreToolUse, so it returns straight away unless `mark`
 # left a flag file — no remote-control round trips on the hot path. busy and
-# idle run once per prompt (UserPromptSubmit, Stop).
+# idle run once per prompt (UserPromptSubmit, Stop). bg comes from the
+# dashboard, which watches for background jobs (no hook fires when they end)
+# and also puts a ▶ right that a skipped Stop (Esc) left behind.
 [[ -n "${KITTY_WINDOW_ID:-}" && -n "${KITTY_LISTEN_ON:-}" ]] || exit 0
 
 match="id:${KITTY_WINDOW_ID}"
@@ -30,6 +33,7 @@ read -r own base < <(kitty @ ls 2>/dev/null | jq -r --argjson w "$KITTY_WINDOW_I
 	| (if $c then "1 " + $c else "0 " + $t.title end)' | head -1)
 base="${base#⏳ }"
 base="${base#▶ }"
+base="${base#▷ }"
 base="${base#● }"  # the earlier working mark
 
 title() {  # title <prefix>: "<prefix> base", or the unmarked title for ""
@@ -46,7 +50,7 @@ case "${1:-}" in
 	mark)
 		mkdir -p "${flag%/*}"
 		touch "$flag"
-		kitty @ set-user-vars --match "$match" claude_wait=1 claude_busy >/dev/null 2>&1
+		kitty @ set-user-vars --match "$match" claude_wait=1 claude_busy claude_bg >/dev/null 2>&1
 		title "⏳"
 		;;
 	clear)
@@ -55,12 +59,16 @@ case "${1:-}" in
 		title ""
 		;;
 	busy)
-		kitty @ set-user-vars --match "$match" claude_busy=1 >/dev/null 2>&1
+		kitty @ set-user-vars --match "$match" claude_busy=1 claude_bg >/dev/null 2>&1
 		title "▶"
 		;;
 	idle)
-		kitty @ set-user-vars --match "$match" claude_busy >/dev/null 2>&1
+		kitty @ set-user-vars --match "$match" claude_busy claude_bg >/dev/null 2>&1
 		title ""
+		;;
+	bg)
+		kitty @ set-user-vars --match "$match" claude_busy claude_bg=1 >/dev/null 2>&1
+		title "▷"
 		;;
 esac
 exit 0

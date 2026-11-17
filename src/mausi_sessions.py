@@ -13,6 +13,7 @@ import json
 import os
 import re
 import subprocess
+import time
 
 import mausi_common as cfg
 
@@ -148,3 +149,54 @@ def write_snapshot():
             os.remove(old)
         update_overview_block(rows)
     return len(rows)
+
+
+AGENT_ACTIVE = 120  # a background agent whose transcript moved this recently is still working
+
+
+def background_tasks():
+    """{session id: number of background jobs still running}: shell commands
+    Claude started in the background (a live process still writes the task's
+    output file) and background agents (their output is a link to the agent's
+    transcript, which keeps moving while it works). Claude Code keeps both
+    under <tmp>/claude-<uid>/<project>/<session>/tasks/. While a turn runs,
+    its foreground command shows up here too: use this for idle sessions.
+    Shell commands are found through /proc, so on macOS only agents count."""
+    import tempfile
+    roots = {tempfile.gettempdir(), "/tmp"}
+    counts, outputs = {}, {}
+    now = time.time()
+    for root in roots:
+        for tasks in glob.glob(os.path.join(root, f"claude-{os.getuid()}", "*", "*", "tasks")):
+            sid = os.path.basename(os.path.dirname(tasks))
+            try:
+                names = os.listdir(tasks)
+            except OSError:
+                continue
+            for name in names:
+                path = os.path.join(tasks, name)
+                if os.path.islink(path):
+                    try:
+                        if now - os.path.getmtime(path) < AGENT_ACTIVE:
+                            counts[sid] = counts.get(sid, 0) + 1
+                    except OSError:
+                        pass  # the link's target is gone
+                else:
+                    outputs[os.path.realpath(path)] = sid
+    if outputs and os.path.isdir("/proc/self/fd"):
+        running = set()
+        for fd_dir in glob.glob("/proc/[0-9]*/fd"):
+            try:
+                fds = os.listdir(fd_dir)
+            except OSError:
+                continue
+            for fd in fds:
+                try:
+                    target = os.readlink(os.path.join(fd_dir, fd))
+                except OSError:
+                    continue
+                if target in outputs:
+                    running.add(target)
+        for target in running:
+            counts[outputs[target]] = counts.get(outputs[target], 0) + 1
+    return counts

@@ -27,7 +27,7 @@
 
 Each restored tab carries kitty user vars the rest of mausi reads:
 claude_session (the session id) and claude_title (the tab's base title;
-mausi-mark adds and strips the ⏳ and ▶ around it).
+mausi-mark adds and strips the ⏳, ▶ and ▷ around it).
 """
 import glob
 import json
