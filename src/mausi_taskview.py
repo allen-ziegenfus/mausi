@@ -784,7 +784,8 @@ def detail_lines(rows, task_id, width):
     for r in group("Sessions", t["sessions"]):
         wait = f"{S.YELLOW}⏳ waiting{S.RESET} " if r.get("wait") else ""
         how = {"attached": "attached with A", "auto": "linked from its first prompts"}.get(r.get("link"), "")
-        lines.append((f"  tab {r['tab']}  {wait}{r.get('title') or r['cwd']}  {S.DIM}{r['cwd']} {r.get('branch', '')}"
+        place = f"in {r['where']}" if r.get("where") else f"tab {r['tab']}"
+        lines.append((f"  {place}  {wait}{r.get('title') or r['cwd']}  {S.DIM}{r['cwd']} {r.get('branch', '')}"
                       f" · {how}{S.RESET}",
                       {"tab": r["tab_id"], "sid": r.get("sid_full"), "cwd": r.get("cwd_full"),
                        "session": r.get("title") or f"tab {r['tab']}"}))

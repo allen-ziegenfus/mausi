@@ -171,6 +171,10 @@ Design notes, the files mausi keeps, and gotchas are in
 [`docs/NOTES.md`](docs/NOTES.md).
 
 Open sessions come from Claude Code's own records in `~/.claude/sessions/`.
+Sessions running outside kitty (Terminal, VS Code) are listed too, marked
+"in Terminal" and without a tab number. Enter on one moves it into kitty: after
+you confirm (and optionally name a task for it), mausi quits it there and resumes
+it in a new tab, only once the old process has exited.
 Notifications use kitty's notification protocol, so they work the same on
 both platforms.
 

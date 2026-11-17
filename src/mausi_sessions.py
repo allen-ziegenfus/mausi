@@ -38,6 +38,31 @@ def alive(pid):
 
 def live_sessions():
     """[(cwd, session id)] of every running interactive Claude Code session."""
+    return [(cwd, sid) for _, cwd, sid in live_records()]
+
+
+def host_app(pid):
+    """The app a process runs under ("Terminal", "Code", "kitty"), from the
+    first ancestor inside an .app bundle (or else its terminal-ish name), or ""."""
+    for _ in range(12):
+        out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        if not out:
+            return ""
+        ppid, _, comm = out.partition(" ")
+        m = re.search(r"([^/]+)\.app/", comm)
+        if m:
+            return m.group(1)
+        name = os.path.basename(comm.strip())
+        if name in ("tmux", "screen", "SCREEN", "sshd", "kitty", "gnome-terminal-server", "konsole", "alacritty", "wezterm-gui"):
+            return name
+        if not ppid.strip().isdigit() or int(ppid) <= 1:
+            return ""
+        pid = int(ppid)
+    return ""
+
+
+def live_records():
+    """[(pid, cwd, session id)] of every running interactive Claude Code session."""
     seen, out = set(), []
     for f in sorted(glob.glob(os.path.join(CLAUDE, "sessions", "*.json"))):
         try:
@@ -50,7 +75,7 @@ def live_sessions():
         if sid in seen or not alive(pid):
             continue
         seen.add(sid)
-        out.append((cwd, sid))
+        out.append((pid, cwd, sid))
     return out
 
 

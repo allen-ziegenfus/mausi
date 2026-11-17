@@ -75,6 +75,7 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import termios
@@ -286,6 +287,29 @@ def sessions():
                     "age": transcript_age(cwd, sid),
                 })
                 break
+    rows += outside_sessions({r["sid_full"] for r in rows})
+    return rows
+
+
+_host_apps = {}  # pid -> app it runs in (a pid's app doesn't change)
+
+
+def outside_sessions(in_kitty):
+    """Sessions running outside kitty (Terminal, VS Code, ...): listed so they
+    can be seen and attached, but they have no tab to jump to."""
+    rows = []
+    for pid, cwd, sid in snapshots.live_records():
+        if sid in in_kitty:
+            continue
+        if pid not in _host_apps:
+            _host_apps[pid] = snapshots.host_app(pid) or "another terminal"
+        rows.append({
+            "tab": None, "tab_id": None, "where": _host_apps[pid], "pid": pid,
+            "title": os.path.basename(cwd), "task_var": "", "active": False, "wait": False,
+            "ticket": "", "branch": git_branch(cwd),
+            "cwd": cwd.replace(HOME, "~", 1), "sid": sid[:8], "sid_full": sid, "cwd_full": cwd,
+            "age": transcript_age(cwd, sid),
+        })
     return rows
 
 
@@ -1313,6 +1337,71 @@ def task_for(text):
     return None
 
 
+def move_into_kitty(action, task_title=""):
+    """Enter on a session running outside kitty: quit it there (SIGTERM), wait
+    for it to exit, then resume it in a new kitty tab. Never resumes while the
+    old process lives: two processes on one session corrupt its transcript."""
+    out, sid, cwd = action["outside"], action["sid"], action["cwd"]
+    pid = out["pid"]
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        return f"can't quit pid {pid} in {out['where']}: not yours"
+    for _ in range(50):  # up to 10 s
+        if not snapshots.alive(pid):
+            break
+        time.sleep(0.2)
+    else:
+        return f"it didn't quit in {out['where']} (pid {pid}); quit it there, then run mausi"
+    title = os.path.basename(cwd) or "claude"
+    q = shlex.quote(sid)
+    shell = os.environ.get("SHELL", "/bin/zsh")
+    cmd = (f"claude --resume {q}; rc=$?; if [ $rc -ne 0 ]; then "
+           f"printf '\\n[mausi] claude --resume %s exited %s — leaving a shell here\\n' {q} \"$rc\"; "
+           f"exec {shlex.quote(shell)} -l; fi")
+    task_var = ["--var", f"claude_task={task_title}"] if task_title else []
+    r = subprocess.run(["kitty", "@", "launch", "--type=tab", "--cwd", cwd, "--tab-title", f"💬 {title}",
+                        "--var", f"claude_session={sid}", "--var", f"claude_title={title}", *task_var,
+                        shell, "-lc", cmd], capture_output=True)
+    return f"moved “{title}” into kitty" if r.returncode == 0 else f"kitty launch failed: {r.stderr.decode()[:80]}"
+
+
+def start_move_into_kitty(ui, action, wakes):
+    """Ask, offer a task for it, then move it (in the background: the quit can
+    take a few seconds)."""
+    out = action["outside"]
+    busy = " It's active right now: a reply in progress is cut off." if out.get("age") == "now" else ""
+
+    def run(task_title):
+        def bg():
+            ui.say(move_into_kitty(action, task_title), 6)
+            wakes[1].set()
+        threading.Thread(target=bg, daemon=True).start()
+
+    def with_task(text):
+        title = ""
+        if text:
+            cwd = action["cwd"].replace(HOME, "~", 1)
+            line = f"Session: `cd {cwd} && claude --resume {action['sid']}` ({action.get('session')})"
+            tid = store().create(text, section=NEW_TASK_SECTION[4:], notes=[line])
+            tasks_view().link_session(action["sid"], text)
+            title = text
+            ui.say(f"added {tid}; moving the session…", 6)
+        run(title)
+        return "" if text else "moving the session…"
+
+    def ask_task():
+        if tasks_view() and tasks_view().session_task_title(action["sid"]):
+            run("")  # already attached to a task
+            return "moving the session…"
+        ui.prompt = {"label": "New task for it? (Enter creates, empty Enter skips, Esc cancels the move):",
+                     "text": os.path.basename(action["cwd"]), "done": with_task, "empty_ok": True}
+        return ""
+    ui.confirm = (f"Quit this session in {out['where']} and resume it in a kitty tab?{busy}", ask_task)
+
+
 def add_task(text, context=None):
     """t: a new task at the top of Follow-ups. context: notes for it, e.g. the
     Slack message it came from."""
@@ -1878,17 +1967,25 @@ def session_lines(rows, detail=False):
         summary = jira.get(r["ticket"], "")
         branch = "" if r["ticket"] and r["branch"].startswith(r["ticket"]) else r["branch"]
         task = tasks_view().session_task_title(r["sid_full"], rows) if tasks_view() else None
-        lines.append((f"{mark} {BOLD}{r['tab']:>2}{RESET}  {ticket} "
+        tab = f"{BOLD}{r['tab']:>2}{RESET}" if r["tab"] else f"{DIM}{'—':>2}{RESET}"
+        where = f"  {MAGENTA}in {r['where']}{RESET}" if r.get("where") else ""
+        lines.append((f"{mark} {tab}  {ticket} "
                       f"{DIM}{r['age']:>4}{RESET}  {r['cwd']}"
                       + (f" {DIM}({branch}){RESET}" if branch else "")
-                      + f"  {DIM}{r['sid']}{RESET}"
+                      + f"  {DIM}{r['sid']}{RESET}" + where
                       + (f"  {CYAN}→ {BOLD}{task.split(' ', 1)[0]}{RESET}{CYAN} {task.split(' ', 1)[1][:50]}{RESET}"
                          if task and " " in task else f"  {CYAN}→ {task}{RESET}" if task
                          else f"  {DIM}(a attaches it to a task){RESET}"),
                       {"tab": r["tab_id"], "sid": r["sid_full"], "cwd": r["cwd_full"],
+                       "outside": ({"pid": r["pid"], "where": r["where"], "age": r["age"]}
+                                   if r.get("where") else None),
                        "session": r.get("title") or f"tab {r['tab']}",
-                       "detail": (f"tab {r['tab']}", f"{r['cwd_full']}\n\nbranch {r['branch'] or '—'}\n"
-                                                      f"session {r['sid_full']}\n\n{summary}")}))
+                       "detail": (f"in {r['where']}" if r.get("where") else f"tab {r['tab']}",
+                                  f"{r['cwd_full']}\n\nbranch {r['branch'] or '—'}\n"
+                                  f"session {r['sid_full']}\n\n{summary}"
+                                  + (f"\n\nRunning in {r['where']}, outside kitty. To give it a tab: quit it there, "
+                                     f"then run `mausi` (it restores from the snapshot history: "
+                                     f"`mausi snapshot --history`, `mausi --from <file>`)." if r.get("where") else ""))}))
         if detail:
             lines += sub(f"{r['cwd_full']} · branch {r['branch'] or '—'} · session {r['sid_full'] or '—'}"
                          f" · last activity {r['age'] or '—'}")
@@ -3163,6 +3260,8 @@ def handle(ui, key, wakes):
         action = ui.action()
         if action and action.get("zoom"):
             ui.toggle_zoom()
+        elif action and action.get("outside"):
+            start_move_into_kitty(ui, action, wakes)
         elif action and "copy" in action:
             ok = copy_to_clipboard(action["copy"])
             ui.say(f"copied: {action['copy_name']}" if ok else "copying to the clipboard failed")
