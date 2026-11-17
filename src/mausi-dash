@@ -6,7 +6,9 @@
 """Live dashboard for mausi — meant to sit in kitty tab 1.
 
 Sessions: one row per kitty tab running Claude — tab number, ⏳ when it is
-waiting on you, Jira ticket (+ summary when JIRA_API_USER/TOKEN are set), git
+waiting on you, ● (green) while Claude is working (hooks: prompt → Stop), ▶ the
+tab you are on; then
+Jira ticket (+ summary when JIRA_API_USER/TOKEN are set), git
 branch, cwd, short session id, and how long since the transcript last moved.
 
 You (top of Now): time since my last break — a pause of 5+ minutes between
@@ -235,6 +237,28 @@ def is_claude(window):
     return False
 
 
+BUSY_STALE = 10 * 60  # a working mark older than this (no transcript write) is ignored
+
+
+def transcript_path(cwd, sid):
+    proj = os.path.join(PROJECTS, re.sub(r"[^A-Za-z0-9]", "-", cwd))
+    if sid:
+        return os.path.join(proj, sid + ".jsonl")
+    try:
+        return max((os.path.join(proj, f) for f in os.listdir(proj) if f.endswith(".jsonl")),
+                   key=os.path.getmtime)
+    except (OSError, ValueError):
+        return ""
+
+
+def transcript_seconds(cwd, sid):
+    """Seconds since the session's transcript last changed (inf if unknown)."""
+    try:
+        return time.time() - os.path.getmtime(transcript_path(cwd, sid))
+    except OSError:
+        return float("inf")
+
+
 def transcript_age(cwd, sid):
     proj = os.path.join(PROJECTS, re.sub(r"[^A-Za-z0-9]", "-", cwd))
     if sid:
@@ -278,6 +302,10 @@ def sessions():
                     "task_var": window.get("user_vars", {}).get("claude_task", ""),
                     "active": tab.get("is_active"),
                     "wait": window.get("user_vars", {}).get("claude_wait") == "1",
+                    # Set by the hooks between your prompt and Claude's Stop. Esc
+                    # skips Stop, so trust it only while the transcript is moving.
+                    "busy": (window.get("user_vars", {}).get("claude_busy") == "1"
+                             and transcript_seconds(cwd, sid) < BUSY_STALE),
                     "ticket": match.group(1) if match else "",
                     "branch": branch,
                     "cwd": cwd.replace(HOME, "~", 1),
@@ -1958,10 +1986,14 @@ def meeting_lines(detail=False):
 
 def session_lines(rows, detail=False):
     waiting = sum(1 for r in rows if r["wait"])
+    working = sum(1 for r in rows if r.get("busy") and not r["wait"])
     lines = [(f"{BOLD}Sessions{RESET} {DIM}({len(rows)}){RESET}"
-              + (f"  {YELLOW}⏳ {waiting} waiting on you{RESET}" if waiting else ""), None)]
+              + (f"  {YELLOW}⏳ {waiting} waiting on you{RESET}" if waiting else "")
+              + (f"  {GREEN}● {working} working{RESET}" if working else ""), None)]
     for r in rows:
-        mark = f"{YELLOW}⏳{RESET}" if r["wait"] else (f"{CYAN}▶{RESET}" if r["active"] else " ")
+        # ⏳ waiting on you > ● Claude working > ▶ the tab you're on
+        mark = (f"{YELLOW}⏳{RESET}" if r["wait"] else f"{GREEN}●{RESET}" if r.get("busy")
+                else f"{CYAN}▶{RESET}" if r["active"] else " ")
         # Pad before colouring so the escape codes don't eat the column width.
         ticket = f"{r['ticket']:<11}" if r["ticket"] else f"{DIM}{'—':<11}{RESET}"
         summary = jira.get(r["ticket"], "")
@@ -2225,13 +2257,16 @@ def notification_lines(detail=False, width=None, history=False):
         fresh = now - e["ts"] < NOTIFY_FRESH and not e["dismissed"]
         color = "" if fresh else DIM
         count = f" {DIM}×{e['count']}{RESET}" if e["count"] > 1 else ""
+        # Fixed-width app column with a gap after it: longer names ("1Password",
+        # "mausi-test") used to run straight into the title.
+        label = e["label"] if len(e["label"]) <= 10 else e["label"][:9] + "…"
         body = f"  {DIM}{e['body']}{RESET}" if e["body"] and not detail else ""
         if detail:
             day = time.strftime("%a %m-%d " if now - e["ts"] > 12 * 3600 else "", time.localtime(e["ts"]))
         else:
             day = ""
         lines.append((f"  {DIM}{day}{time.strftime('%H:%M', time.localtime(e['ts']))}{RESET} "
-                      f"{CYAN if fresh else DIM}{e['label']:<9}{RESET}{color}{e['summary']}{RESET}{count}{body}",
+                      f"{CYAN if fresh else DIM}{label:<10}{RESET} {color}{e['summary']}{RESET}{count}{body}",
                       {"open": e["url"], "notification": e["id"], "close": e["ids"],
                        "task_seed": {"title": f"Follow up: {e['summary']}", "source": e["label"],
                                      "context": [f"From a {e['label']} notification, "

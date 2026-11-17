@@ -14,6 +14,13 @@ match="id:${KITTY_WINDOW_ID}"
 tab="window_id:${KITTY_WINDOW_ID}"  # set-tab-title matches tabs: id: would be a tab id
 flag="${XDG_RUNTIME_DIR:-/tmp}/mausi-notify/kitty-marked/${KITTY_WINDOW_ID}"
 
+# busy/idle: whether Claude is working in this window (user var claude_busy,
+# read by mausi-dash). One remote-control call each; called from
+# UserPromptSubmit and Stop, not from the per-tool hooks.
+case "${1:-}" in
+	busy) kitty @ set-user-vars --match "$match" claude_busy=1 >/dev/null 2>&1; exit 0 ;;
+	idle) kitty @ set-user-vars --match "$match" claude_busy >/dev/null 2>&1; exit 0 ;;
+esac
 [[ "${1:-}" == clear && ! -e "$flag" ]] && exit 0
 
 # Base title: the one mausi recorded, else whatever the tab shows now
@@ -30,7 +37,7 @@ case "${1:-}" in
 	mark)
 		mkdir -p "${flag%/*}"
 		touch "$flag"
-		kitty @ set-user-vars --match "$match" claude_wait=1 >/dev/null 2>&1
+		kitty @ set-user-vars --match "$match" claude_wait=1 claude_busy >/dev/null 2>&1
 		[[ -n "$base" ]] && kitty @ set-tab-title --match "$tab" "⏳ $base" >/dev/null 2>&1
 		;;
 	clear)

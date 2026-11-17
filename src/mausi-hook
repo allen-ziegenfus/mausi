@@ -2,7 +2,9 @@
 # Claude Code hooks for mausi (registered by the mausi plugin, hooks/hooks.json):
 #
 #   mausi-hook notify   # Notification: desktop notification + ⏳ on the tab
-#   mausi-hook clear    # PreToolUse / UserPromptSubmit / Stop: take both away
+#   mausi-hook clear    # PreToolUse: take both away (and mark working again after a wait)
+#   mausi-hook busy     # UserPromptSubmit: take both away, mark the session working
+#   mausi-hook idle     # Stop: take both away, mark it idle
 #
 # The notification goes through kitty's desktop-notification protocol (OSC 99,
 # the same one `kitten notify` speaks), written to the terminal of the Claude
@@ -85,12 +87,22 @@ case "${1:-}" in
 		mkdir -p "$state" && touch "$state/$session_id"
 		"$here/mausi-mark" mark
 		;;
-	clear)
+	clear | busy | idle)
+		# clear: PreToolUse; busy: UserPromptSubmit; idle: Stop.
+		was_waiting=""
 		"$here/mausi-mark" clear
 		if [[ -e "$state/$session_id" ]]; then
+			was_waiting=1
 			rm -f "$state/$session_id"
 			send --identifier "mausi-$session_id"
 		fi
+		# A tool call right after a wait (a permission prompt you approved)
+		# means Claude is working again.
+		case "$1" in
+			busy) "$here/mausi-mark" busy ;;
+			idle) "$here/mausi-mark" idle ;;
+			clear) [[ -n "$was_waiting" ]] && "$here/mausi-mark" busy ;;
+		esac
 		;;
 esac
 exit 0

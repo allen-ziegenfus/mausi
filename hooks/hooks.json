@@ -7,11 +7,11 @@
       { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/src/mausi-hook\" clear" } ] }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/src/mausi-hook\" clear" } ] }
+      { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/src/mausi-hook\" idle" } ] }
     ],
     "UserPromptSubmit": [
       { "hooks": [
-        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/src/mausi-hook\" clear" },
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/src/mausi-hook\" busy" },
         { "type": "command", "command": "python3 -I \"${CLAUDE_PLUGIN_ROOT}/src/mausi-guard\"", "timeout": 5 }
       ] }
     ],
