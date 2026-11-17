@@ -77,6 +77,12 @@ DEFAULTS = {
         "snapshot": "~/.claude/open-sessions.tsv",
         "history": "~/.claude/session-history",
     },
+    "autosave": {
+        "enabled": True,                    # SessionEnd: resume the closed session once to save notes and memories
+        "min_prompts": 3,                   # sessions with fewer of your prompts aren't saved
+        "model": "",                        # e.g. "sonnet" for cheaper saves; empty = your default
+        "skip_reasons": ["clear"],          # SessionEnd reasons that don't save (/clear)
+    },
     # Optional extensions: each is off until configured.
     "board": {
         "url": "",                          # a local work board serving /api/dash.json (PRs, Jira)

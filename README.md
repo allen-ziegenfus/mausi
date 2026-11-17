@@ -17,6 +17,11 @@ A [kitty](https://sw.kovidgoyal.net/kitty/) add-on for working with many
   notification names the tab, and clicking it focuses that tab.
 - **A task guard.** If a prompt in one task's session names another task's
   ticket or PR, Claude is asked to point out the mix-up before doing the work.
+- **Autosave on close.** When you close a session, mausi resumes it once in the
+  background (`claude -p`) to do the save you'd otherwise ask for: notes, tags
+  and done on its task, and memories. It skips short sessions, `/clear`, and
+  sessions whose last prompt already asked to save. Results go to
+  `~/.local/state/mausi/autosave.log`; turn it off with `[autosave] enabled = false`.
 
 Works on Linux and macOS. It's a personal tool that grew over a few months of
 daily use, so expect rough edges.
@@ -56,7 +61,7 @@ what's missing, one yes/no question each:
 
 - **kitty**: one line in `kitty.conf`, `geninclude ~/mausi/kitty/mausi.py`
 - **Claude Code**: the mausi plugin, installed from the checkout: the hooks
-  (notifications, ⏳ on tabs, the task guard), a skill that tells Claude how to
+  (notifications, ⏳ on tabs, the task guard, autosave), a skill that tells Claude how to
   use the task store, and `mausi`/`tasks` on Claude's PATH
 - **PATH**: `~/mausi/bin` in your shell profile
 - **Status line** (only if Claude Code has none): model, folder, the session's

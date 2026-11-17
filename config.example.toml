@@ -36,6 +36,12 @@ my_name = ""                     # an @mention of this name highlights a Slack c
 snapshot = "~/.claude/open-sessions.tsv"  # the open sessions, restored by `mausi`
 history = "~/.claude/session-history"
 
+[autosave]
+enabled = true                   # when a session closes, resume it once (claude -p) to save task notes and memories
+min_prompts = 3                  # sessions with fewer of your prompts aren't saved
+model = ""                       # e.g. "sonnet" for cheaper saves; empty = your default model
+skip_reasons = ["clear"]         # SessionEnd reasons that don't save
+
 # --- optional extensions: each is off until set ---------------------------
 
 [board]

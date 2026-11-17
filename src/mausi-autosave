@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""SessionEnd hook: save a session when it's closed, the way you'd otherwise
+ask before closing it ("anything to save?").
+
+The session's Claude is gone by the time this runs, so the hook starts a
+detached `claude -p --resume <id>` in the session's folder with a save prompt:
+notes, tags and done on the task (`tasks`), and memories. That run can only use
+`tasks` and edit files under ~/.claude (memory); anything else is refused.
+
+Skipped when:
+- [autosave] enabled = false in config.toml
+- the session ended with /clear (reasons in [autosave] skip_reasons)
+- it has fewer than [autosave] min_prompts of your prompts, or none since the
+  last autosave of the same session
+- your last prompt already asked to save
+- it is an autosave run itself (MAUSI_AUTOSAVE is set)
+
+The resume waits until Claude Code has removed the session's record in
+~/.claude/sessions/ (the old process has exited): two processes on one session
+corrupt its transcript. Each run is logged to ~/.local/state/mausi/autosave.log.
+
+Never blocks and never fails: any problem just means no save.
+"""
+import datetime
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+PROMPT = """This session has just been closed. Do the save the user would otherwise ask for before closing it, then stop:
+- If it belongs to a mausi task (it runs in a task folder, or it worked on a task it names), record what was done, decided and left open as short notes with `tasks note <id> "..."`, add search words with `tasks tag`, and run `tasks done` only if the task was clearly resolved. Skip what the task's notes already say.
+- Save what's worth remembering, following your memory instructions; skip what's already saved.
+- Change no code, don't commit or push, and contact no one. If there's nothing worth saving, do nothing.
+Reply with one line: what you saved."""
+
+ALLOWED = ["Bash(tasks:*)", "Read", "Glob", "Grep", "Write(~/.claude/**)", "Edit(~/.claude/**)"]
+SAVE_ASKED = re.compile(r"\b(save|saved|saving)\b", re.I)
+WAIT_EXIT = 60  # seconds to wait for the old process to go
+
+
+def settings():
+    out = {"enabled": True, "min_prompts": 3, "model": "", "skip_reasons": ["clear"]}
+    try:
+        import mausi_common as cfg
+        out.update(cfg.config().get("autosave", {}))
+        state = cfg.STATE_DIR
+    except Exception:
+        state = os.path.join(os.path.expanduser("~"), ".local", "state", "mausi")
+    return out, state
+
+
+def user_prompts(transcript):
+    """Your prompts in a transcript (not tool results, commands or meta lines)."""
+    out = []
+    try:
+        with open(transcript) as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("type") != "user" or d.get("isMeta") or d.get("isSidechain"):
+                    continue
+                c = d.get("message", {}).get("content")
+                if isinstance(c, list):
+                    c = " ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
+                if isinstance(c, str) and c.strip() and not c.lstrip().startswith(("<command-", "<local-command", "<bash-")):
+                    out.append(c)
+    except OSError:
+        pass
+    return out
+
+
+def load(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def still_open(sid):
+    for f in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
+        rec = load(f)
+        if rec.get("sessionId") == sid and rec.get("kind", "interactive") == "interactive":
+            try:
+                os.kill(int(rec.get("pid")), 0)
+                return True
+            except (ProcessLookupError, ValueError, TypeError):
+                continue
+            except PermissionError:
+                return True
+    return False
+
+
+def log(state, text):
+    os.makedirs(state, exist_ok=True)
+    with open(os.path.join(state, "autosave.log"), "a") as f:
+        f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')} {text}\n")
+
+
+def hook():
+    if os.environ.get("MAUSI_AUTOSAVE"):
+        return
+    event = json.load(sys.stdin)
+    conf, state = settings()
+    sid, cwd, transcript = event.get("session_id"), event.get("cwd"), event.get("transcript_path")
+    if not (conf.get("enabled") and sid and cwd and transcript and os.path.isdir(cwd)):
+        return
+    if event.get("reason") in conf.get("skip_reasons", []):
+        return
+    prompts = user_prompts(transcript)
+    seen_path = os.path.join(state, "autosave-seen.json")
+    seen = load(seen_path)
+    if len(prompts) < int(conf.get("min_prompts", 3)) or len(prompts) <= seen.get(sid, 0):
+        return
+    if SAVE_ASKED.search(prompts[-1]):
+        return  # you just asked for it
+    seen[sid] = len(prompts) + 1  # + the save prompt itself
+    os.makedirs(state, exist_ok=True)
+    with open(seen_path, "w") as f:
+        json.dump(seen, f)
+    subprocess.Popen([sys.executable, os.path.realpath(__file__), "--run", sid, cwd],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def run(sid, cwd):
+    conf, state = settings()
+    deadline = time.time() + WAIT_EXIT
+    while still_open(sid):
+        if time.time() > deadline:
+            log(state, f"{sid[:8]} {cwd}: skipped, the session is still open")
+            return
+        time.sleep(1)
+    claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+    here = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    env = {**os.environ, "MAUSI_AUTOSAVE": "1",
+           "PATH": os.pathsep.join([os.path.join(here, "bin"), "/opt/homebrew/bin", os.environ.get("PATH", "")])}
+    cmd = [claude, "-p", "--resume", sid, "--permission-mode", "dontAsk", "--allowedTools", *ALLOWED]
+    if conf.get("model"):
+        cmd += ["--model", conf["model"]]
+    r = subprocess.run(cmd + ["--", PROMPT], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                       capture_output=True, text=True, timeout=600)
+    out = (r.stdout.strip() or r.stderr.strip() or f"exit {r.returncode}").replace("\n", " ")
+    log(state, f"{sid[:8]} {cwd}: {out[:500]}")
+
+
+if __name__ == "__main__":
+    try:
+        if sys.argv[1:2] == ["--run"]:
+            run(sys.argv[2], sys.argv[3])
+        else:
+            hook()
+    except Exception as e:  # never fail the hook
+        try:
+            log(settings()[1], f"error: {type(e).__name__}: {e}")
+        except Exception:
+            pass
