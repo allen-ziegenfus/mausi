@@ -70,7 +70,6 @@ Infra is refreshed in a background thread because kubectl against a dead
 cluster can take seconds; the session list redraws every couple of seconds.
 """
 import calendar
-import html
 import json
 import os
 import re
@@ -91,6 +90,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import mausi_common as cfg  # noqa: E402
 import mausi_sessions as snapshots  # noqa: E402
+import mausi_context as context  # noqa: E402
 
 HOME = cfg.HOME
 PROJECTS = os.path.join(HOME, ".claude", "projects")
@@ -106,10 +106,6 @@ BOARD_URL = cfg.get("board", "url").rstrip("/")  # "" = no PR/Jira sections
 JIRA_SITE = cfg.get("jira", "site").rstrip("/")
 JIRA_BROWSE = f"{JIRA_SITE}/browse/" if JIRA_SITE else "https://jira.invalid/browse/"
 FORWARD_NAME = cfg.get("review", "forward_name") or "the final reviewer"
-MERGED_COMMENT_RE = re.compile(r"^\s*merged\b", re.I)          # "Merged. Thank you."
-# CI's "…successfully forwarded to owner#123", or a reviewer's "See owner#123"
-FORWARDED_COMMENT_RE = re.compile(r"\bforwarded to\b|^\s*see [\w.-]+#\d+\W*$", re.I)
-SUPERSEDED_COMMENT_RE = re.compile(r"^\s*superseded\b", re.I)
 BOARD_TASKS = {"open": BOARD_URL + "/tasks"} if BOARD_URL else {}  # the board's task page, if any
 CALENDAR_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "calendar")))  # [] = no Today section
 MAIL_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "mail")))          # [] = no Mail section
@@ -813,33 +809,6 @@ def you_lines(detail=False, width=None):
     return lines
 
 
-def fetch_infra():
-    data = {"docker": None, "k3d": [], "kube": None}
-    out = run(["docker", "ps", "--format", "{{json .}}"])
-    if out is not None:
-        data["docker"] = [json.loads(l) for l in out.splitlines() if l.strip()]
-    out = run(["k3d", "cluster", "list", "-o", "json"])
-    data["k3d"] = json.loads(out) if out else []
-
-    ctx = (run(["kubectl", "config", "current-context"]) or "").strip()
-    if ctx:
-        pods = kubectl_json("get", "pods", "-A")
-        kube = {"ctx": ctx, "pods": None, "nodes": [], "hosts": {}}
-        if pods is not None:
-            kube["pods"] = pods["items"]
-            kube["nodes"] = (kubectl_json("get", "nodes") or {"items": []})["items"]
-            # Ingress hosts by backend service name, so a pod row can open its app.
-            for ing in (kubectl_json("get", "ingress", "-A") or {"items": []})["items"]:
-                ns = ing["metadata"]["namespace"]
-                for rule in ing["spec"].get("rules", []):
-                    for path in rule.get("http", {}).get("paths", []):
-                        svc = path.get("backend", {}).get("service", {}).get("name")
-                        if svc and rule.get("host"):
-                            kube["hosts"].setdefault((ns, svc), rule["host"])
-        data["kube"] = kube
-    return data
-
-
 def docker_lines(containers, detail=False):
     if containers is None:
         return [(f"{BOLD}Docker{RESET} {RED}unavailable{RESET}", None)]
@@ -875,14 +844,6 @@ def k3d_lines(clusters):
         dot = f"{GREEN}●{RESET}" if up else f"{DIM}○{RESET}"
         lines.append((f"  {dot} {c['name']:<28} {up}/{len(nodes)} nodes running", None))
     return lines
-
-
-def kubectl_json(*args):
-    out = run(["kubectl", *args, "-o", "json", "--request-timeout=3s"], 6)
-    try:
-        return json.loads(out) if out else None
-    except json.JSONDecodeError:
-        return None
 
 
 def pod_containers(pod):
@@ -939,7 +900,7 @@ def kube_lines(kube, detail=False):
         # Deployment pods are <deployment>-<rs hash>-<pod hash>; the service
         # usually shares the deployment's name.
         app = re.sub(r"-[a-z0-9]{8,10}-[a-z0-9]{5}$", "", name)
-        host = kube["hosts"].get((ns, app))
+        host = kube["hosts"].get(f"{ns}/{app}")
         action = {"shell": ["kubectl", "exec", "-it", "-n", ns, name, "--", *SHELL_CMD], "name": name,
                   "detail": (f"{ns}/{name}", "\n".join(
                       f"{c['name']}: {next(iter(c.get('state', {})), '?')}, ready={c.get('ready')}, "
@@ -1008,48 +969,6 @@ def pr_line(pr):
     if key:
         action.update(ticket=key.group(1), repo=pr["ref"].split("/", 1)[1].split("#")[0])
     return (f"  {pr_state(pr)} {age(pr)} {pr['title']}  {DIM}{pr['ref']}{RESET}  " + " ".join(tags), action)
-
-
-board_refresh = threading.Event()  # set by r: the next fetch asks the board to drop its caches
-
-
-def fetch_work():
-    if not BOARD_URL:
-        return {"error": "no board configured"}
-    url = BOARD_URL + "/api/dash.json" + ("?refresh=1" if board_refresh.is_set() else "")
-    board_refresh.clear()
-    try:
-        with urllib.request.urlopen(url, timeout=60) as r:
-            return mark_review_merges(cfg.clean(json.load(r)))
-    except (OSError, ValueError) as e:
-        return {"error": f"board unreachable ({e})"}
-
-
-def mark_review_merges(data):
-    """Reviewers often merge by pushing the commits themselves and closing the
-    PR with "Merged. Thank you.": GitHub calls that closed, not merged. Such a
-    PR is marked merged when the board lists it to close in Jira or the last
-    comment, by someone other than its author, starts with "merged". A PR
-    closed because it went on to another repo ("forwarded to …", "See
-    owner#123") is marked forwarded; one closed as "Superseded…", superseded."""
-    if not isinstance(data, dict):
-        return data
-    to_close = {i.get("id") for i in data.get("to_close") or []}
-    lists = [data.get(k) for k in ("mine", "forwards", "involved")]
-    lists.append((data.get("recent") or {}).get("prs") if isinstance(data.get("recent"), dict) else None)
-    for prs in lists:
-        for pr in prs or []:
-            if not isinstance(pr, dict) or pr.get("merged") or not pr.get("closed"):
-                continue
-            said = pr.get("last_comment_text") or ""
-            by_other = pr.get("last_comment") and pr.get("last_comment") != pr.get("author")
-            if pr.get("ref") in to_close or (by_other and MERGED_COMMENT_RE.search(said)):
-                pr["merged"] = True
-            elif FORWARDED_COMMENT_RE.search(said):
-                pr["forwarded"] = True
-            elif SUPERSEDED_COMMENT_RE.search(said):
-                pr["superseded"] = True
-    return data
 
 
 def fetch_detail(path, force=False):
@@ -1824,36 +1743,6 @@ def task_lines(data, detail=False, width=None, only=None):
     return lines
 
 
-def meetings_loop(wake):
-    global meetings, meetings_tomorrow, mail
-    while True:
-        if MAIL_CMD:
-            try:
-                unread = cfg.clean(json.loads(run(MAIL_CMD, 60) or ""))
-                unread["error"] = None
-            except (TypeError, json.JSONDecodeError):
-                unread = {"unread": [], "error": f"{MAIL_CMD[0]} failed"}
-            with lock:
-                mail = unread
-        if CALENDAR_CMD:
-            tomorrow = time.strftime("%Y-%m-%d", time.localtime(time.time() + 86400))
-            try:
-                later = cfg.clean(json.loads(run(CALENDAR_CMD + [tomorrow], 60) or ""))
-            except (TypeError, json.JSONDecodeError):
-                later = {"events": []}
-            out = run(CALENDAR_CMD, 60)
-            try:
-                data = cfg.clean(json.loads(out))
-                data["error"] = None
-                data.setdefault("running", True)  # the command can say its source isn't running
-            except (TypeError, json.JSONDecodeError):
-                data = {"events": [], "synced": None, "error": f"{CALENDAR_CMD[0]} failed"}
-            with lock:
-                meetings, meetings_tomorrow = data, later
-        wake.wait(MEETINGS_REFRESH)
-        wake.clear()
-
-
 def parse_time(stamp):
     return time.mktime(time.strptime(stamp[:16], "%Y-%m-%dT%H:%M"))
 
@@ -2028,26 +1917,6 @@ def session_lines(rows, detail=False):
     return lines
 
 
-def work_loop(wake):
-    global work_data
-    while True:
-        data = fetch_work()
-        with lock:
-            work_data = data
-        wake.wait(WORK_REFRESH)
-        wake.clear()
-
-
-def infra_loop(wake):
-    global infra_data
-    while True:
-        data = fetch_infra()
-        with lock:
-            infra_data = data
-        wake.wait(INFRA_REFRESH)
-        wake.clear()
-
-
 ANSI = re.compile(r"(\033\[[0-9;]*m)")
 # Below this width the two views are shown one at a time instead of side by side.
 TWO_COLUMN_WIDTH = 140
@@ -2112,40 +1981,7 @@ def tail(path, size=65536):  # last `size` bytes, as lines
         return []
 
 
-# Chromium web apps put their site first in the body:
-#   <a href="https://app.slack.com/">app.slack.com</a>\n\nAlex Example: Hey team!
-ORIGIN_RE = re.compile(r'^\s*<a href="(https?://[^"]+)">[^<]*</a>\s*')
-SITES = (("app.slack.com", "Slack"), ("mail.google.com", "Mail"), ("calendar.google.com", "Calendar"),
-         ("meet.google.com", "Meet"), ("atlassian.net", "Jira"), ("github.com", "GitHub"))
-
-
-def notification_source(n):
-    """(label, url to open, message text) for a captured notification."""
-    app, summary = n.get("app", ""), n.get("summary", "")
-    body = n.get("body", "") or ""
-    origin = ORIGIN_RE.match(body)
-    if origin:
-        body = body[origin.end():]
-    text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", body))).strip()
-    if text == "default":
-        text = ""  # logged before mausi-notif-capture parsed multi-line bodies
-    link = re.search(r"https?://[^\s<>\"]+", text)
-
-    label, home = app, None
-    if origin:
-        site = origin.group(1)
-        label = next((name for host, name in SITES if host in site), re.sub(r"^https?://|/.*$", "", site))
-        home = site
-    elif app == "Chromium":
-        # Older entries without a body: tell the web apps apart by title.
-        if summary.endswith("(Jira)"):
-            label, home = "Jira", (f"{JIRA_SITE}/jira/your-work" if JIRA_SITE else None)
-        elif re.search(r"\(.+ - [A-Z][a-z]{2} \d{1,2}\)$", summary):
-            label, home = "Meet", "https://meet.google.com"
-        else:
-            # Mostly Slack, though Gmail ones (sender as title) look the same.
-            label, home = "Slack", "https://app.slack.com/client"
-    return label, (link.group(0) if link else home), text
+notification_source = context.notification_source
 
 
 def load_dismissed():
@@ -2193,18 +2029,16 @@ def close_desktop(ids):
 
 def recent_notification_ids(window=NOTIFY_ZOOM_WINDOW):
     """Server ids of everything captured in the window, for D (dismiss all)."""
-    now, ids = time.time(), []
-    for line in reversed(tail(NOTIFICATIONS, 4 << 20)):
-        try:
-            n = cfg.clean(json.loads(line))
-            ts = time.mktime(time.strptime(n["ts"][:19], "%Y-%m-%dT%H:%M:%S"))
-        except (ValueError, KeyError):
-            continue
-        if now - ts > window:
-            break
-        if "id" in n:
-            ids.append(n["id"])
-    return ids
+    now = time.time()
+    return [n["id"] for n in notification_items() if now - n["ts"] <= window and n.get("id") is not None]
+
+
+def notification_items(history=False):
+    """Captured notifications, newest first: the collector's last 3 days, or
+    for history (a search in the zoomed view) the whole log, read here."""
+    if history:
+        return context.read_notifications(window=10 * 365 * 86400, size=64 << 20)
+    return (ctx.data("notifications") or {}).get("items", []) if ctx else []
 
 
 def notification_lines(detail=False, width=None, history=False):
@@ -2214,17 +2048,12 @@ def notification_lines(detail=False, width=None, history=False):
     limit = NOTIFY_HISTORY_MAX if history else NOTIFY_ZOOM_MAX if detail else NOTIFY_MAX
     now = time.time()
     events = []
-    for line in reversed(tail(NOTIFICATIONS, 64 << 20 if history else 4 << 20 if detail else 65536)):
-        try:
-            n = cfg.clean(json.loads(line))
-            ts = time.mktime(time.strptime(n["ts"][:19], "%Y-%m-%dT%H:%M:%S"))
-        except (ValueError, KeyError):
-            continue
+    for n in notification_items(history):
+        ts, label, url, body = n["ts"], n["label"], n["url"], n["body"]
         if now - ts > window:
             break
-        if n.get("app", "") in NOTIFY_SKIP:
+        if n["app"] in NOTIFY_SKIP:
             continue
-        label, url, body = notification_source(n)
         if label == "Slack":
             continue  # they have their own section
         key = (label, n.get("summary", ""), body)
@@ -2289,15 +2118,10 @@ def slack_messages(window):
     dm, sender, text, mention, dismissed}."""
     now = time.time()
     out, seen = [], {}
-    for line in reversed(tail(NOTIFICATIONS, 4 << 20)):
-        try:
-            n = cfg.clean(json.loads(line))
-            ts = time.mktime(time.strptime(n["ts"][:19], "%Y-%m-%dT%H:%M:%S"))
-        except (ValueError, KeyError):
-            continue
+    for n in notification_items():
+        ts, label, body = n["ts"], n["label"], n["body"]
         if now - ts > window:
             break
-        label, _, body = notification_source(n)
         if label != "Slack":
             continue
         summary = n.get("summary", "")
@@ -3037,14 +2861,50 @@ def start_view():
     return 0
 
 
+ctx = None  # mausi_context.Context: the one place the data comes from
+
+
+class Wake:
+    """What handle() sets to refresh a section now: asks the collector to
+    fetch the source(s) behind it."""
+
+    def __init__(self, *sources):
+        self.sources = sources
+
+    def set(self):
+        for source in self.sources:
+            ctx.refresh(source)
+
+
+def on_context(name, entry):
+    """A source has new data: hand it to the section globals the views read."""
+    global work_data, infra_data, mail, meetings, meetings_tomorrow
+    data, error = entry.get("data"), entry.get("error")
+    with lock:
+        if name == "board":
+            work_data = data if data is not None else {"error": error or "no data"}
+        elif name == "infra":
+            infra_data = data
+        elif name == "mail":
+            mail = dict(data or {"unread": []}, error=error if data is None else None)
+        elif name == "calendar":
+            today = (data or {}).get("today") or {"events": [], "synced": None}
+            meetings = dict(today, error=error if not today.get("events") and error else None)
+            meetings.setdefault("running", True)
+            meetings_tomorrow = (data or {}).get("tomorrow") or {"events": []}
+
+
 def start_loops():
-    """The background threads that fetch data; returns their wake events
-    (infra, work, meetings, activity), which handle() sets to refresh now."""
+    """Attach to the collector (mausi_context: run it here unless `mausi
+    context --watch` or another dashboard does) and start the activity loop.
+    Returns the wake objects (infra, work, meetings, activity) handle() sets
+    to refresh now."""
+    global ctx
     load_jira_cache()
-    wakes = (threading.Event(), threading.Event(), threading.Event(), threading.Event())
-    for loop, wake in zip((infra_loop, work_loop, meetings_loop, activity_loop), wakes):
-        threading.Thread(target=keep_running, args=(loop, wake), daemon=True).start()
-    return wakes
+    ctx = context.attach(on_context)
+    activity = threading.Event()
+    threading.Thread(target=keep_running, args=(activity_loop, activity), daemon=True).start()
+    return (Wake("infra"), Wake("board"), Wake("calendar", "mail"), activity)
 
 
 def keep_running(loop, wake):
@@ -3432,9 +3292,8 @@ def handle(ui, key, wakes):
         ui.open_popup()
     elif key == "r":
         store().sync()
-        board_refresh.set()
-        for wake in wakes:
-            wake.set()
+        ctx.refresh(hard=True)
+        wakes[3].set()
         ui.say("refreshing — Jira and GitHub fresh from the board", 3)
     elif key == "m":
         url = next_meet()

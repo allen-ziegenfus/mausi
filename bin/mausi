@@ -16,6 +16,12 @@
     mausi snapshot --history # list earlier snapshots
     mausi snapshot --resume  # print a resume command per session
     mausi tasks ...          # the task store (same as `tasks ...`)
+    mausi context            # what the collector last fetched (board, mail,
+                             # calendar, notifications, infra, sessions), by age
+    mausi context --json     # the whole file, for scripts and triage
+    mausi context --watch    # run the collector on its own (the dashboard
+                             # otherwise runs it)
+    mausi context --refresh [SOURCE]  # ask the collector to fetch now
     mausi setup              # offer the kitty, Claude Code and PATH setup that is
                              # missing (plain `mausi` offers it too, once)
 
@@ -193,6 +199,9 @@ def main():
         os.execv(os.path.join(SRC, "mausi-dash"), ["mausi-dash", *args[1:]])
     if args[:1] == ["tasks"]:
         os.execv(os.path.join(HERE, "tasks"), ["tasks", *args[1:]])
+    if args[:1] == ["context"]:
+        import mausi_context
+        return mausi_context.main(args[1:])
     if args[:1] == ["snapshot"]:
         return cmd_snapshot(args[1:])
     if args[:1] == ["setup"]:
