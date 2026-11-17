@@ -1810,6 +1810,41 @@ def mail_lines(detail=False, width=None):
     return lines
 
 
+TRIAGE_MARK = {"now": (RED, "●"), "today": (YELLOW, "●"), "soon": (DIM, "○")}
+
+
+def needs_lines(detail=False, width=None):
+    """Needs you: what mausi-triage (Claude over the context) picked out."""
+    entry = ctx.get("triage") if ctx else None
+    head = f"{BOLD}Needs you{RESET}"
+    if not entry or not entry.get("data"):
+        return [(f"{head} {DIM}(i asks Claude){RESET}", None)]
+    t = entry["data"]
+    stamp = time.strftime("%H:%M", time.localtime(t.get("at", 0)))
+    error = f" {RED}{t['error'][:60]}{RESET}" if t.get("error") else ""
+    lines = [(f"{head} {DIM}(Claude at {stamp} · i asks again){RESET}{error}", None)]
+    if t.get("summary"):
+        lines += [(f"  {DIM}{l}{RESET}", None) for l in textwrap.wrap(t["summary"], max(30, (width or 100) - 4))[:None if detail else 2]]
+    for item in t.get("items") or []:
+        color, mark = TRIAGE_MARK.get(item.get("urgency"), (DIM, "○"))
+        ref = item.get("ref") or ""
+        key = TICKET_ANY_RE.search(ref) or TICKET_ANY_RE.search(item.get("title", ""))
+        action = {"open": item.get("url") or (JIRA_BROWSE + key.group(0) if key else None),
+                  "task_seed": {"title": item["title"], "source": f"triage ({item.get('source')})",
+                                "context": [f"Triage {time.strftime('%Y-%m-%d %H:%M', time.localtime(t.get('at', 0)))}: "
+                                            f"{item.get('why', '')} [{item.get('source')}: {ref}]"]},
+                  "detail": (f"{item.get('urgency')} · {item.get('source')} · {ref}",
+                             item["title"] + "\n\n" + item.get("why", "") + (f"\n\n{item['url']}" if item.get("url") else ""))}
+        if key:
+            action["ticket"] = key.group(0)
+        lines.append((f"  {color}{mark}{RESET} {item['title']}  {DIM}{item.get('why', '')}{RESET}", action))
+        if detail and ref:
+            lines.append((f"      {DIM}{item.get('source')} · {ref}{RESET}", None))
+    if not t.get("items"):
+        lines.append((f"  {DIM}nothing needs you{RESET}", None))
+    return lines
+
+
 def meeting_lines(detail=False):
     with lock:
         data, later = meetings, meetings_tomorrow
@@ -2220,6 +2255,8 @@ def section_lines(name, rows, detail=False, width=None, history=False):
         return you_lines(detail, width)
     if name == "today":
         return meeting_lines(detail)
+    if name == "needs":
+        return needs_lines(detail, width)
     if name == "sessions":
         return session_lines(rows, detail)
     if name == "notifications":
@@ -2253,17 +2290,18 @@ def section_lines(name, rows, detail=False, width=None, history=False):
     return []
 
 
-VIEW_SECTIONS = {"Now": ("you", "today", "sessions", "pinned", "tasks", "docker", "kube"),
+VIEW_SECTIONS = {"Now": ("you", "today", "needs", "sessions", "pinned", "tasks", "docker", "kube"),
                  "Work": ("slack", "notifications", "mail", "notes", "prs", "jira", "jira_created", "recent")}
 # Sections whose source isn't set up are left out: the board (PRs, Jira), the
 # calendar and mail commands, and the notification log (Linux capture).
 _SOURCE = {"today": bool(cfg.get("commands", "calendar")), "mail": bool(cfg.get("commands", "mail")),
            "prs": bool(BOARD_URL), "jira": bool(BOARD_URL), "jira_created": bool(BOARD_URL), "recent": bool(BOARD_URL),
+           "needs": bool(cfg.get("triage", "enabled")),
            "slack": os.path.exists(NOTIFICATIONS) or bool(cfg.get("notifications", "capture")),
            "notifications": os.path.exists(NOTIFICATIONS) or bool(cfg.get("notifications", "capture")),
            "docker": bool(shutil.which("docker")), "kube": bool(shutil.which("kubectl") or shutil.which("k3d"))}
 VIEW_SECTIONS = {view: tuple(n for n in names if _SOURCE.get(n, True)) for view, names in VIEW_SECTIONS.items()}
-SECTION_TITLES = {"you": "You", "today": "Today", "sessions": "Sessions", "docker": "Docker", "kube": "Kubernetes",
+SECTION_TITLES = {"you": "You", "today": "Today", "needs": "Needs you", "sessions": "Sessions", "docker": "Docker", "kube": "Kubernetes",
                   "notifications": "Notifications", "slack": "Slack", "mail": "Mail", "notes": "Notes", "prs": "PRs", "jira": "Jira: assigned to me", "jira_created": "Jira: created by me", "recent": "Recently closed", "tasks": "Tasks",
                   "pinned": "Now (pinned tasks)"}
 
@@ -2816,6 +2854,7 @@ Search (task view and zoomed sections)
 Notes and more
   b               save the clipboard as a snippet
   m               open the Meet link of the next meeting
+  i               ask Claude again what needs you (Needs you; [triage])
   L               log energy ([energy] log)
 
 Prompts: Enter saves · Esc cancels · Ctrl-U clears.
@@ -3295,6 +3334,9 @@ def handle(ui, key, wakes):
         ctx.refresh(hard=True)
         wakes[3].set()
         ui.say("refreshing — Jira and GitHub fresh from the board", 3)
+    elif key == "i":
+        ctx.refresh("triage", hard=True)
+        ui.say("asking Claude what needs you (a few seconds)…", 5)
     elif key == "m":
         url = next_meet()
         if url:

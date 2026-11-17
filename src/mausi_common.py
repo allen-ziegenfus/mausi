@@ -90,6 +90,11 @@ DEFAULTS = {
     "jira": {
         "site": "",                         # e.g. https://example.atlassian.net
     },
+    "triage": {
+        "enabled": False,                   # every 30 min (when something new came in) and on i: Claude reads
+                                            # the context and lists what needs you; sends mail and Slack to Claude
+        "model": "sonnet",                  # the claude -p model for it
+    },
     "review": {
         "forward_owner": "",                # GitHub owner whose repo PRs are forwarded to for the final review
         "forward_name": "",                 # who that is, for labels ("waiting on <name>")

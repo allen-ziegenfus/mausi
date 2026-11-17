@@ -258,6 +258,30 @@ def fetch_sessions(hard=False):
     return [{"cwd": cwd, "session": sid} for cwd, sid in mausi_sessions.live_sessions()], None
 
 
+TRIAGE = os.path.join(cfg.CACHE_DIR, "triage.json")
+TRIAGE_EVERY = 30 * 60  # at most this often on its own (and only when the input changed); i runs it now
+
+
+def fetch_triage(hard=False):
+    """What mausi-triage (Claude over this context) last said needs me:
+    {at, summary, items: [{title, why, urgency, source, ref, url}], error}.
+    Runs it when asked (hard) or when its answer is older than TRIAGE_EVERY."""
+    try:
+        with open(TRIAGE) as f:
+            last = json.load(f)
+    except (OSError, ValueError):
+        last = {}
+    if hard or time.time() - last.get("at", 0) > TRIAGE_EVERY:
+        here = os.path.dirname(os.path.realpath(__file__))
+        run([os.path.join(here, "mausi-triage"), "--quiet"] + (["--force"] if hard else []), 300)
+        try:
+            with open(TRIAGE) as f:
+                last = json.load(f)
+        except (OSError, ValueError):
+            pass
+    return (last or None), (last or {}).get("error")
+
+
 def notifications_changed():
     """A stamp that changes when the notification log or the dismissed list
     does, so the notifications source can be re-read only then."""
@@ -279,6 +303,7 @@ SOURCES = {
     "notifications": (fetch_notifications, 2, True),  # cheap: re-read only when the log changes
     "infra": (fetch_infra, 15, True),
     "sessions": (fetch_sessions, 15, True),
+    "triage": (fetch_triage, 60, bool(cfg.get("triage", "enabled"))),
 }
 
 
