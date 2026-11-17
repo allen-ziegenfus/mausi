@@ -5,7 +5,7 @@
 #
 #   mausi-mark mark    # waiting on you: "⏳ title", user var claude_wait=1
 #   mausi-mark clear   # no longer waiting: title back, claude_wait unset
-#   mausi-mark busy    # Claude is working: "● title", user var claude_busy=1
+#   mausi-mark busy    # Claude is working: "▶ title", user var claude_busy=1
 #   mausi-mark idle    # Claude stopped: title back, claude_busy unset
 #
 # mausi-picker and mausi-dash read the user vars.
@@ -29,7 +29,8 @@ read -r own base < <(kitty @ ls 2>/dev/null | jq -r --argjson w "$KITTY_WINDOW_I
 	| ($t.windows[] | select(.id == $w) | .user_vars.claude_title) as $c
 	| (if $c then "1 " + $c else "0 " + $t.title end)' | head -1)
 base="${base#⏳ }"
-base="${base#● }"
+base="${base#▶ }"
+base="${base#● }"  # the earlier working mark
 
 title() {  # title <prefix>: "<prefix> base", or the unmarked title for ""
 	if [[ -n "$1" ]]; then
@@ -55,7 +56,7 @@ case "${1:-}" in
 		;;
 	busy)
 		kitty @ set-user-vars --match "$match" claude_busy=1 >/dev/null 2>&1
-		title "●"
+		title "▶"
 		;;
 	idle)
 		kitty @ set-user-vars --match "$match" claude_busy >/dev/null 2>&1

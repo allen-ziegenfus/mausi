@@ -6,7 +6,7 @@
 """Live dashboard for mausi — meant to sit in kitty tab 1.
 
 Sessions: one row per kitty tab running Claude — tab number, ⏳ when it is
-waiting on you, ● (green) while Claude is working (hooks: prompt → Stop), ▶ the
+waiting on you, ▶ (green) while Claude is working (hooks: prompt → Stop), › the
 tab you are on; then
 Jira ticket (+ summary when JIRA_API_USER/TOKEN are set), git
 branch, cwd, short session id, and how long since the transcript last moved.
@@ -1989,11 +1989,11 @@ def session_lines(rows, detail=False):
     working = sum(1 for r in rows if r.get("busy") and not r["wait"])
     lines = [(f"{BOLD}Sessions{RESET} {DIM}({len(rows)}){RESET}"
               + (f"  {YELLOW}⏳ {waiting} waiting on you{RESET}" if waiting else "")
-              + (f"  {GREEN}● {working} working{RESET}" if working else ""), None)]
+              + (f"  {GREEN}▶ {working} working{RESET}" if working else ""), None)]
     for r in rows:
-        # ⏳ waiting on you > ● Claude working > ▶ the tab you're on
-        mark = (f"{YELLOW}⏳{RESET}" if r["wait"] else f"{GREEN}●{RESET}" if r.get("busy")
-                else f"{CYAN}▶{RESET}" if r["active"] else " ")
+        # ⏳ waiting on you > ▶ Claude working > › the tab you're on
+        mark = (f"{YELLOW}⏳{RESET}" if r["wait"] else f"{GREEN}▶{RESET}" if r.get("busy")
+                else f"{CYAN}›{RESET}" if r["active"] else " ")
         # Pad before colouring so the escape codes don't eat the column width.
         ticket = f"{r['ticket']:<11}" if r["ticket"] else f"{DIM}{'—':<11}{RESET}"
         summary = jira.get(r["ticket"], "")
