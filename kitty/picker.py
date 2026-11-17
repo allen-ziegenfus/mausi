@@ -31,11 +31,12 @@ def tabs():
             wins = tab.get("windows", [])
             active = next((w for w in wins if w.get("is_active")), wins[0] if wins else {})
             waiting = any(w.get("user_vars", {}).get("claude_wait") == "1" for w in wins)
-            title = tab.get("title", "").removeprefix("⏳ ")
+            busy = any(w.get("user_vars", {}).get("claude_busy") == "1" for w in wins)
+            title = tab.get("title", "").removeprefix("⏳ ").removeprefix("● ")
             cwd = active.get("cwd", "")
             if cwd.startswith(HOME):
                 cwd = "~" + cwd[len(HOME):]
-            rows.append({"id": tab["id"], "label": f"{'⏳ ' if waiting else ''}{n}: {title}", "cwd": cwd})
+            rows.append({"id": tab["id"], "label": f"{'⏳ ' if waiting else '● ' if busy else ''}{n}: {title}", "cwd": cwd})
     return rows
 
 

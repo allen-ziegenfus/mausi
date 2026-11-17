@@ -1,26 +1,23 @@
 #!/usr/bin/env bash
-# Put a ⏳ on the current kitty tab while its
-# Claude session is waiting on you, and take it off again. Called from the
-# Claude Code hooks (mausi-hook). No-op outside kitty.
+# Mark the current kitty tab with what its Claude session is doing, and take
+# the mark off again. Called from the Claude Code hooks (mausi-hook). No-op
+# outside kitty.
 #
-# The waiting state also goes into the window's user var claude_wait, which is
-# what mausi-picker and mausi-dash read.
+#   mausi-mark mark    # waiting on you: "⏳ title", user var claude_wait=1
+#   mausi-mark clear   # no longer waiting: title back, claude_wait unset
+#   mausi-mark busy    # Claude is working: "● title", user var claude_busy=1
+#   mausi-mark idle    # Claude stopped: title back, claude_busy unset
+#
+# mausi-picker and mausi-dash read the user vars.
 #
 # `clear` runs on every PreToolUse, so it returns straight away unless `mark`
-# left a flag file — no remote-control round trips on the hot path.
+# left a flag file — no remote-control round trips on the hot path. busy and
+# idle run once per prompt (UserPromptSubmit, Stop).
 [[ -n "${KITTY_WINDOW_ID:-}" && -n "${KITTY_LISTEN_ON:-}" ]] || exit 0
 
 match="id:${KITTY_WINDOW_ID}"
 tab="window_id:${KITTY_WINDOW_ID}"  # set-tab-title matches tabs: id: would be a tab id
 flag="${XDG_RUNTIME_DIR:-/tmp}/mausi-notify/kitty-marked/${KITTY_WINDOW_ID}"
-
-# busy/idle: whether Claude is working in this window (user var claude_busy,
-# read by mausi-dash). One remote-control call each; called from
-# UserPromptSubmit and Stop, not from the per-tool hooks.
-case "${1:-}" in
-	busy) kitty @ set-user-vars --match "$match" claude_busy=1 >/dev/null 2>&1; exit 0 ;;
-	idle) kitty @ set-user-vars --match "$match" claude_busy >/dev/null 2>&1; exit 0 ;;
-esac
 [[ "${1:-}" == clear && ! -e "$flag" ]] && exit 0
 
 # Base title: the one mausi recorded, else whatever the tab shows now
@@ -32,22 +29,37 @@ read -r own base < <(kitty @ ls 2>/dev/null | jq -r --argjson w "$KITTY_WINDOW_I
 	| ($t.windows[] | select(.id == $w) | .user_vars.claude_title) as $c
 	| (if $c then "1 " + $c else "0 " + $t.title end)' | head -1)
 base="${base#⏳ }"
+base="${base#● }"
+
+title() {  # title <prefix>: "<prefix> base", or the unmarked title for ""
+	if [[ -n "$1" ]]; then
+		[[ -n "$base" ]] && kitty @ set-tab-title --match "$tab" "$1 $base" >/dev/null 2>&1
+	elif [[ "$own" == 1 ]]; then
+		kitty @ set-tab-title --match "$tab" "$base" >/dev/null 2>&1
+	else
+		kitty @ set-tab-title --match "$tab" "" >/dev/null 2>&1  # back to following the window title
+	fi
+}
 
 case "${1:-}" in
 	mark)
 		mkdir -p "${flag%/*}"
 		touch "$flag"
 		kitty @ set-user-vars --match "$match" claude_wait=1 claude_busy >/dev/null 2>&1
-		[[ -n "$base" ]] && kitty @ set-tab-title --match "$tab" "⏳ $base" >/dev/null 2>&1
+		title "⏳"
 		;;
 	clear)
 		rm -f "$flag"
 		kitty @ set-user-vars --match "$match" claude_wait >/dev/null 2>&1
-		if [[ "$own" == 1 ]]; then
-			kitty @ set-tab-title --match "$tab" "$base" >/dev/null 2>&1
-		else
-			kitty @ set-tab-title --match "$tab" "" >/dev/null 2>&1  # back to following the window title
-		fi
+		title ""
+		;;
+	busy)
+		kitty @ set-user-vars --match "$match" claude_busy=1 >/dev/null 2>&1
+		title "●"
+		;;
+	idle)
+		kitty @ set-user-vars --match "$match" claude_busy >/dev/null 2>&1
+		title ""
 		;;
 esac
 exit 0
