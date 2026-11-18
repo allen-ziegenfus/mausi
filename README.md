@@ -178,6 +178,11 @@ Each of these is off until you configure it:
   `i` with its remote images, and `f` full screen.
   In the zoomed Mail section, Enter after `/` searches every folder on the
   server (the mail command's `--search WORDS`).
+- **`[mail] sync`**: a command the collector runs every 5 minutes (and after
+  a delete) to keep a local copy of the mail. `mausi-mail
+  --local <command>` then searches and reads from it at once, older archives
+  too, and goes to the server when the copy isn't there; the command's
+  contract (search, file) is in `bin/mausi-mail`.
 - **`[commands] reminders`**: a command that prints open reminders or to-dos
   from any app as JSON, `{"items": [{"id", "title", "group", "due", "priority",
   "note", "url"}]}` (`due` is `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM`, local, or

@@ -43,6 +43,7 @@ JIRA_SITE = cfg.get("jira", "site").rstrip("/")
 CALENDAR_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "calendar")))
 MAIL_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "mail")))
 REMINDERS_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "reminders")))
+MAIL_SYNC_CMD = shlex.split(os.path.expanduser(cfg.get("mail", "sync")))
 NOTIFICATIONS = cfg.data_path("notifications", "log", "notifications.jsonl")
 DISMISSED = os.path.join(cfg.CACHE_DIR, "dismissed.json")
 NOTIFY_KEEP = 3 * 86400  # how far back the notifications source goes (Slack's zoomed window)
@@ -104,6 +105,20 @@ def fetch_mail(hard=False):
         return cfg.clean(json.loads(run(MAIL_CMD, 60) or "")), None
     except (TypeError, json.JSONDecodeError):
         return None, f"{MAIL_CMD[0]} failed"
+
+
+def fetch_mail_sync(hard=False):
+    """[mail] sync: bring the local mail copy up to date (here, where the
+    dashboard's permissions apply, rather than in a background job of its
+    own). {"at", "seconds"}."""
+    start = time.time()
+    try:
+        r = subprocess.run(MAIL_SYNC_CMD, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, f"mail sync: {e}"
+    if r.returncode != 0:
+        return None, f"mail sync: {(r.stderr.strip().splitlines() or ['exit %d' % r.returncode])[-1][:120]}"
+    return {"at": start, "seconds": round(time.time() - start, 1)}, None
 
 
 def fetch_reminders(hard=False):
@@ -409,6 +424,7 @@ SOURCES = {
     "mail": (fetch_mail, 120, bool(MAIL_CMD)),
     "calendar": (fetch_calendar, 120, bool(CALENDAR_CMD)),
     "reminders": (fetch_reminders, 120, bool(REMINDERS_CMD)),
+    "mail_sync": (fetch_mail_sync, 300, bool(MAIL_SYNC_CMD)),
     "projects": (fetch_projects, 60, bool(cfg.config().get("projects"))),
     "notifications": (fetch_notifications, 2, True),  # cheap: re-read only when the log changes
     "infra": (fetch_infra, 15, True),

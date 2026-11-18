@@ -105,6 +105,8 @@ DEFAULTS = {
     "projects": {},                         # Projects section: group name = [folders or globs], e.g.
                                             # personal = ["~/src/app", "~/src/tools-*"]
     "mail": {
+        "sync": "",                         # run every 5 min by the collector (and after a delete): keeps
+                                            # the local copy of the mail mausi-mail --local reads
         "viewer": False,                    # Enter on a mail: a box over the dashboard; d deletes (the mail
                                             # command must take --raw ID and --delete ID, as mausi-mail does)
         "render": "",                       # HTML to PNG, for the rendered view (h): <cmd> IN.html OUT.png

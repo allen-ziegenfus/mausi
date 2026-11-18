@@ -16,6 +16,15 @@ mausi's Mail section reads.
     mausi-mail ... --search "WORDS"      # mails with all the words, in every folder but
                                          # the trash, spam, drafts (--all-folders: those too)
 
+With --local CMD, a local copy of the mail answers --search and --raw (kept
+up to date by something else, e.g. mausi's [mail] sync), when it's there;
+else they go to the server. CMD indexes Maildir folders and is run as
+
+    CMD search LIMIT WORD...     # the matching mails' files, newest first, one a line
+    CMD file MESSAGE-ID          # that mail's file (nothing if there's none)
+
+--maildir is the account's folder in the copy, for the folder names shown.
+
 Each listing also keeps the listed mails whole in --cache (default
 ~/.cache/mausi/mail, readable only by you; mails no longer listed are
 removed), so --raw is instant for them.
@@ -31,6 +40,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import ssl
 import subprocess
 import sys
@@ -319,6 +329,61 @@ def search(connect, query, mine, web, limit, all_folders=False):
     return found[:limit]
 
 
+def local(command, *args):
+    r = subprocess.run(command + list(args), capture_output=True, timeout=30)
+    if r.returncode != 0:
+        raise OSError(r.stderr.decode(errors="replace").strip() or f"{command[0]} failed")
+    return r.stdout.decode(errors="replace")
+
+
+def local_ok(command, maildir):
+    return bool(command) and shutil.which(command[0]) and (not maildir or os.path.isdir(maildir))
+
+
+SKIP_LOCAL = r"trash|deleted messages|deleted items|spam|junk|drafts|templates"  # --skip: the local copy's
+
+
+def local_search(command, maildir, query, mine, web, limit, all_folders=False, skip=SKIP_LOCAL):
+    """--search from the local copy: the files `command search` gives, newest
+    first, read here (flags from their Maildir names)."""
+    words = query.split()
+    if not words:
+        return []
+    top = os.path.dirname(maildir.rstrip("/")) if maildir else ""
+    skip_re = re.compile(rf"(?i)(^|/)({skip})(/|$)")
+    found, seen = [], set()
+    for path in local(command, "search", str(limit * 4), *words).splitlines():
+        box = os.path.dirname(os.path.dirname(path))  # <folder>/{cur,new}/<file>
+        under = maildir if maildir and path.startswith(maildir.rstrip("/") + "/") else top
+        folder = os.path.relpath(box, under) if under else os.path.basename(box)
+        if not all_folders and skip_re.search(folder):
+            continue
+        try:
+            with open(path, "rb") as f:
+                head = f.read(65536).split(b"\r\n\r\n", 1)[0].split(b"\n\n", 1)[0]
+        except OSError:
+            continue
+        info = os.path.basename(path).rsplit(":2,", 1)[-1] if ":2," in path else ""
+        meta = b"FLAGS (" + (b"\\Seen " if "S" in info else b"") + (b"\\Flagged" if "F" in info else b"") + b")"
+        m = summary(meta, head, mine, web, folder)
+        if m["message_id"] in seen:
+            continue
+        seen.add(m["message_id"])
+        found.append(m)
+        if len(found) >= limit:
+            break
+    return found
+
+
+def local_raw(command, message_id):
+    """The mail's file from the local copy, or None."""
+    files = local(command, "file", checked_id(message_id)).splitlines()
+    if files and os.path.exists(files[0]):
+        with open(files[0], "rb") as f:
+            return f.read()
+    return None
+
+
 def act(imap, a):
     """--raw / --delete: one mail, by its Message-ID, in any folder."""
     if a.raw:
@@ -355,6 +420,10 @@ def main():
     one.add_argument("--delete", metavar="MESSAGE-ID", help="move that mail to the trash folder")
     one.add_argument("--search", metavar="WORDS", help="every folder: mails with all the words (sender, subject, text)")
     ap.add_argument("--limit", type=int, default=50, help="most results for --search (default 50)")
+    ap.add_argument("--local", default="", help="the local copy's command (see above): --search and --raw use it")
+    ap.add_argument("--maildir", default="", help="the account's folder in the local copy, for folder names")
+    ap.add_argument("--skip", default=SKIP_LOCAL,
+                    help="regex: local-copy folders a search leaves out (trash, spam, drafts; in the account's language)")
     ap.add_argument("--folder", help="for --raw/--delete: the folder it's in (as --search shows it), looked in first")
     ap.add_argument("--all-folders", action="store_true", help="--search the trash, spam, drafts and templates too")
     ap.add_argument("--cache", default=CACHE, help=f"where listed mails are kept whole (default {CACHE}; '' = nowhere)")
@@ -364,6 +433,22 @@ def main():
             sys.stdout.buffer.write(f.read())
         return 0
     mine = {a.user.lower(), *(m.lower() for m in a.me)}
+    maildir = os.path.realpath(os.path.expanduser(a.maildir)) if a.maildir else ""
+    local_cmd = shlex.split(os.path.expanduser(a.local)) if a.local else []
+    if local_ok(local_cmd, maildir) and (a.raw or a.search is not None):
+        try:
+            if a.raw:
+                raw = local_raw(local_cmd, a.raw)
+                if raw is not None:
+                    sys.stdout.buffer.write(raw)
+                    return 0
+            else:
+                found = local_search(local_cmd, maildir, a.search, mine, a.web, a.limit, a.all_folders, a.skip)
+                print(json.dumps({"query": a.search, "source": "local", "unread": [m for m in found if not m["read"]],
+                                  "messages": found}, ensure_ascii=False))
+                return 0
+        except (OSError, subprocess.TimeoutExpired) as e:  # the server, then
+            print(f"local: {e}", file=sys.stderr)
 
     secret = password(a.password_cmd)
 

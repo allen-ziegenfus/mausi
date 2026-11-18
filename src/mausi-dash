@@ -3355,6 +3355,7 @@ def delete_mail(message_id, subject):
                     mail[key] = [m for m in mail[key] if m.get("message_id") != message_id]
     if ctx:
         ctx.refresh("mail")
+        ctx.refresh("mail_sync")  # the local copy follows (if there is one)
     return f"deleted: {subject[:60]}"
 
 
