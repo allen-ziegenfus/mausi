@@ -2926,6 +2926,8 @@ Stages: PLAN ▸ DEV ▸ REVIEW ▸ FWD (forwarded to the final reviewer) ▸ VE
 # right, so L (log energy) needs the Shift.
 CASED_KEYS = ("D", "L")
 KEY_RE = re.compile(r"\033\[<[0-9;]*[mM]|\033\[[0-9;]*[~A-Za-z]|\033O[A-Z]|\033|.", re.S)
+# An escape sequence that hasn't ended yet, at the end of what was read.
+PARTIAL_RE = re.compile(rb"\033(?:\[<?[0-9;]*|O)?$")
 # SGR mouse report: ESC [ < button ; column ; row M. Buttons 64/65 are the wheel.
 MOUSE_RE = re.compile(r"\033\[<(\d+);(\d+);(\d+)[mM]")
 
@@ -2943,7 +2945,20 @@ def read_keys(fd):
     # rest of an escape sequence (ESC [ A) after the first byte, so select()
     # never sees it. One read can hold several keypresses (key repeat, fast
     # typing), so it is split into keys.
-    data = os.read(fd, 64).decode(errors="ignore")
+    # A fast mouse wheel sends a burst of reports; a read can end in the middle
+    # of one, and its tail ("5;30;12M") would come out as keys: digits switch
+    # tabs. So an escape sequence cut off at the end is completed first (a lone
+    # Esc, with nothing after it, stays the Esc key).
+    data = os.read(fd, 4096)
+    while PARTIAL_RE.search(data) and select.select([fd], [], [], 0.05)[0]:
+        more = os.read(fd, 4096)
+        if not more:
+            break
+        data += more
+    tail = PARTIAL_RE.search(data)
+    if tail and tail.group(0) != b"\033":  # still cut off: drop the fragment rather than type it
+        data = data[:tail.start()]
+    data = data.decode(errors="ignore")
     return [k if k == "\033" else mouse_key(k) if k.startswith("\033[<")
             else KEYS.get(k, "") if k.startswith("\033") else k
             for k in KEY_RE.findall(data)]
@@ -3132,7 +3147,7 @@ def main():
             for key in keys:
                 if key.startswith("wheel"):
                     direction, column = key.split(":")
-                    step = 3 if direction == "wheeldown" else -3
+                    step = 1 if direction == "wheeldown" else -1  # kitty already sends several events per notch
                     if ui.popup:
                         ui.scroll_popup(step)
                     else:
