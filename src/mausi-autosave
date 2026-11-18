@@ -142,7 +142,7 @@ def run(sid, cwd):
     claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
     here = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     env = {**os.environ, "MAUSI_AUTOSAVE": "1",
-           "PATH": os.pathsep.join([os.path.join(here, "bin"), "/opt/homebrew/bin", os.environ.get("PATH", "")])}
+           "PATH": os.pathsep.join([os.path.join(here, "bin"), os.environ.get("PATH", "")])}
     cmd = [claude, "-p", "--resume", sid, "--permission-mode", "dontAsk", "--allowedTools", *ALLOWED]
     if conf.get("model"):
         cmd += ["--model", conf["model"]]
