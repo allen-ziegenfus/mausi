@@ -42,7 +42,7 @@ BOARD_URL = cfg.get("board", "url").rstrip("/")
 JIRA_SITE = cfg.get("jira", "site").rstrip("/")
 CALENDAR_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "calendar")))
 MAIL_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "mail")))
-REMINDERS_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "reminders")))
+REMINDERS_CMDS = cfg.reminders_commands()
 MAIL_SYNC_CMD = shlex.split(os.path.expanduser(cfg.get("mail", "sync")))
 NOTIFICATIONS = cfg.data_path("notifications", "log", "notifications.jsonl")
 DISMISSED = os.path.join(cfg.CACHE_DIR, "dismissed.json")
@@ -122,21 +122,32 @@ def fetch_mail_sync(hard=False):
 
 
 def fetch_reminders(hard=False):
-    """The reminders command's output: {"items": [...]}, items without an id or
-    title left out."""
-    try:
-        data = cfg.clean(json.loads(run(REMINDERS_CMD, 60) or ""))
-    except (TypeError, json.JSONDecodeError):
-        return None, f"{REMINDERS_CMD[0]} failed"
-    items = data.get("items") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        return None, f"{REMINDERS_CMD[0]}: no items list"
-    keep = [i for i in items if isinstance(i, dict) and i.get("id") and i.get("title")]
+    """The reminders commands' output merged: {"items": [...], "digests":
+    [{"title", "lines"}]}; each item knows its command ("source": its index),
+    items without an id or title are left out. One that fails leaves the
+    others' items, and an error."""
     fields = ("id", "title", "group", "due", "priority", "note", "url")
-    out = {"items": [{k: str(i.get(k) or "") for k in fields} for i in keep]}
-    if isinstance(data.get("digest"), list):  # what the command gives triage
-        out.update(digest=[str(x) for x in data["digest"]], digest_title=str(data.get("digest_title") or ""))
-    return out, None
+    out, errors = {"items": [], "digests": []}, []
+    for n, cmd in enumerate(REMINDERS_CMDS):
+        name = os.path.basename(cmd[0])
+        try:
+            data = cfg.clean(json.loads(run(cmd, 60) or ""))
+        except (TypeError, json.JSONDecodeError):
+            errors.append(f"{name} failed")
+            continue
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            errors.append(f"{name}: no items list")
+            continue
+        keep = [i for i in items if isinstance(i, dict) and i.get("id") and i.get("title")]
+        out["items"] += [dict({k: str(i.get(k) or "") for k in fields}, source=n) for i in keep]
+        if isinstance(data.get("digest"), list) and data["digest"]:  # what the command gives triage
+            out["digests"].append({"title": str(data.get("digest_title") or "Reminders"),
+                                   "lines": [str(x) for x in data["digest"]]})
+    out["items"].sort(key=lambda r: (not r["due"], r["due"], r["group"], r["title"].lower()))
+    if errors and not out["items"]:
+        return None, "; ".join(errors)
+    return out, ("; ".join(errors) or None)
 
 
 def git(path, *args, timeout=5):
@@ -423,7 +434,7 @@ SOURCES = {
     "board": (fetch_board, 60 if BOARD_URL else 180, cfg.BOARD),  # a command (e.g. gh) is slower: every 3 min
     "mail": (fetch_mail, 120, bool(MAIL_CMD)),
     "calendar": (fetch_calendar, 120, bool(CALENDAR_CMD)),
-    "reminders": (fetch_reminders, 120, bool(REMINDERS_CMD)),
+    "reminders": (fetch_reminders, 120, bool(REMINDERS_CMDS)),
     "mail_sync": (fetch_mail_sync, 300, bool(MAIL_SYNC_CMD)),
     "projects": (fetch_projects, 60, bool(cfg.config().get("projects"))),
     "notifications": (fetch_notifications, 2, True),  # cheap: re-read only when the log changes

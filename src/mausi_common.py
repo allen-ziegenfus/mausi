@@ -116,7 +116,8 @@ DEFAULTS = {
         "calendar": "",                     # prints today's meetings as JSON (optional arg: YYYY-MM-DD)
         "mail": "",                         # prints unread mail as JSON
         "mail_open": "",                    # opens one mail; {id} is replaced with its Message-ID
-        "reminders": "",                    # prints open reminders/to-dos as JSON ({"items": [...]}); --complete ID marks one done
+        "reminders": "",                    # prints open reminders/to-dos as JSON ({"items": [...]}); --complete ID marks
+                                            # one done. A list of commands: their items merged, R adds with the first
         "worktree": "",                     # makes/opens a ticket worktree: <cmd> <KEY>
     },
 }
@@ -359,6 +360,13 @@ def process_args(pid):
         return out.stdout.split()
     except (OSError, subprocess.SubprocessError):
         return []
+
+
+def reminders_commands():
+    """[commands] reminders as argv lists: one command (a string) or several
+    (a list; their items are merged, R adds with the first)."""
+    value = get("commands", "reminders") or []
+    return [shlex.split(os.path.expanduser(c)) for c in ([value] if isinstance(value, str) else value) if c.strip()]
 
 
 def board_commands():

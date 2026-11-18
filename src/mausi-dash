@@ -171,8 +171,10 @@ meetings_tomorrow = {"events": []}
 mail = None  # the mail command's output: Inbox mail (all of it in zoom, unread otherwise)
 projects_data = None  # the projects source: {"groups": [{"name", "projects": [...]}]}
 PROJECTS_MAX = 6  # rows per group in the dashboard; zoom shows them all
+REMINDERS_MAX = 8  # due reminders in the dashboard; zoom shows them all
 reminders = None  # the reminders command's output: {"items": [...]} (due ones here, all in zoom)
-REMINDERS_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "reminders")))
+REMINDERS_CMDS = cfg.reminders_commands()  # each item says whose it is ("source"); R adds with the first
+REMINDERS_CMD = REMINDERS_CMDS[0] if REMINDERS_CMDS else []
 PIN_HEAD = "\033[1;30;43m"  # bold black on yellow, for the pinned Now tasks
 MAIL_MAX = 6  # rows in the dashboard; zoom shows them all
 activity_data = None  # {"stamps": [epoch, ...]} — today's messages I typed to Claude
@@ -1885,14 +1887,18 @@ def reminder_lines(detail=False, width=None):
     head = f"{BOLD}Reminders{RESET}"
     if data is None:
         return [(head, None)] + LOADING
-    if data["error"]:
+    every = data.get("items") or []
+    if data["error"] and not every:
         return [(f"{head} {RED}{data['error']}{RESET}", None)]
     today, now = time.strftime("%Y-%m-%d"), time.strftime("%Y-%m-%dT%H:%M")
-    every = data.get("items") or []
     due = [r for r in every if r.get("due") and r["due"][:10] <= today]
     lines = [(f"{head} {DIM}({len(due)} due of {len(every)} open · "
-              + ("d marks done · R new" if detail else "z for all") + f"){RESET}", None)]
+              + ("d marks done · R new" if detail else "z for all") + f"){RESET}"
+              + (f" {RED}{data['error'][:60]}{RESET}" if data["error"] else ""), None)]
     shown = sorted(every, key=lambda r: (not r.get("due"), r.get("due") or "", r.get("group", ""))) if detail else due
+    more = 0
+    if not detail and len(shown) > REMINDERS_MAX:  # the oldest due first; z shows the rest
+        more, shown = len(shown) - REMINDERS_MAX, shown[:REMINDERS_MAX]
     group = None
     for r in shown:
         if detail and not r.get("due") and r.get("group") != group:
@@ -1910,7 +1916,7 @@ def reminder_lines(detail=False, width=None):
                 when = f"{DIM}{d[5:10]:>5}{RESET}"
         else:
             when = " " * 5
-        mark = {"high": f"{RED}!!{RESET}", "medium": f"{YELLOW}! {RESET}"}.get(r.get("priority"), "  ")
+        mark = {"high": f"{RED}!! {RESET}", "medium": f"{YELLOW}!  {RESET}"}.get(r.get("priority"), "   ")
         where = f"  {DIM}{r['group']}{RESET}" if r.get("group") and (r.get("due") or not detail) else ""
         note = r.get("note") or ""
         action = {"reminder": r["id"], "reminder_title": r["title"],
@@ -1922,6 +1928,8 @@ def reminder_lines(detail=False, width=None):
         if r.get("url"):
             action["open"] = r["url"]
         lines.append((f"  {when} {mark}{r['title']}{where}", action))
+    if more:
+        lines.append((f"  {DIM}+{more} more due · z for all{RESET}", {"zoom": True}))
     if not shown:
         lines.append((f"  {DIM}nothing due{RESET}", None))
     return lines
@@ -2064,9 +2072,17 @@ def projects_lines(rows, detail=False, width=None):
     return lines
 
 
+def reminder_command(rid):
+    """The reminders command an item came from."""
+    with lock:
+        item = next((x for x in (reminders or {}).get("items", []) if x.get("id") == rid), {})
+    n = item.get("source", 0)
+    return REMINDERS_CMDS[n] if isinstance(n, int) and 0 <= n < len(REMINDERS_CMDS) else REMINDERS_CMD
+
+
 def complete_reminder(rid, title):
     try:
-        r = subprocess.run(REMINDERS_CMD + ["--complete", rid], capture_output=True, text=True, timeout=10)
+        r = subprocess.run(reminder_command(rid) + ["--complete", rid], capture_output=True, text=True, timeout=10)
     except subprocess.TimeoutExpired:
         return "couldn't mark it done: the reminders command took over 10 s"
     if r.returncode != 0:
@@ -3664,7 +3680,8 @@ def on_context(name, entry):
         elif name == "projects":
             projects_data = {"groups": [], "error": error} if error or data is None else dict(data, error=None)
         elif name == "reminders":
-            reminders = {"items": [], "error": error} if error or data is None else dict(data, error=None)
+            # one command failing leaves the others' items, with the error shown
+            reminders = {"items": [], "error": error} if data is None else dict(data, error=error)
         elif name == "calendar":
             today = (data or {}).get("today") or {"events": [], "synced": None}
             meetings = dict(today, error=error if not today.get("events") and error else None)

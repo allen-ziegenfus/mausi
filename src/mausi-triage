@@ -170,14 +170,21 @@ def digest(doc):
         out.append("## Other notifications, last 8h")
         out += [f"- {when(n['ts'])} {n['label']}: {clip(n['summary'], 120)} — {clip(n['body'], 200)}"
                 + (f" · {n['url']}" if n.get("url") else "") for n in other[:25]]
-    # Any source can hand triage its own part: {"digest": [lines], "digest_title": "..."}.
-    # The command decides what Claude sees; nothing here knows what it is.
+    # Any source can hand triage its own part: {"digest": [lines], "digest_title": "..."}
+    # or several, {"digests": [{"title", "lines"}]}. The command decides what Claude
+    # sees; nothing here knows what it is.
     for name, entry in sorted(src.items()):
         d = (entry or {}).get("data")
-        lines = d.get("digest") if isinstance(d, dict) else None
-        if isinstance(lines, list) and lines:
-            out.append(f"## {clip(d.get('digest_title') or name.capitalize(), 120)}")
-            out += [f"- {clip(line, 400)}" for line in lines[:40]]
+        if not isinstance(d, dict):
+            continue
+        parts = [p for p in d.get("digests") or [] if isinstance(p, dict)]
+        if isinstance(d.get("digest"), list):
+            parts.insert(0, {"title": d.get("digest_title"), "lines": d["digest"]})
+        for part in parts:
+            lines = part.get("lines")
+            if isinstance(lines, list) and lines:
+                out.append(f"## {clip(part.get('title') or name.capitalize(), 120)}")
+                out += [f"- {clip(line, 400)}" for line in lines[:40]]
     return "\n".join(out)
 
 
