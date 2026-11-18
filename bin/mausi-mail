@@ -13,6 +13,8 @@ mausi's Mail section reads.
 
     mausi-mail ... --raw MESSAGE-ID      # the whole mail (RFC 822), still unread
     mausi-mail ... --delete MESSAGE-ID   # move it to the trash folder
+    mausi-mail ... --search "WORDS"      # mails with all the words, in every folder but
+                                         # the trash, spam, drafts (--all-folders: those too)
 
 Each listing also keeps the listed mails whole in --cache (default
 ~/.cache/mausi/mail, readable only by you; mails no longer listed are
@@ -169,22 +171,29 @@ def trash_folder(imap):
     raise SystemExit("no trash folder (\\Trash) on the server")
 
 
-def find(imap, wanted, readonly=True):
-    """(folder, uid) of the mail in the Inbox, which is left selected."""
+def find(imap, wanted, readonly=True, hint=None):
+    """(folder, uid) of the mail: in hint (a folder's name as text) if given,
+    else the Inbox first, then every other folder; the folder is left selected."""
+    order = [("INBOX", "INBOX")] + [(n, t) for n, t, _ in folders(imap) if t.upper() != "INBOX"]
+    if hint:
+        order = [f for f in order if f[1] == hint] + [f for f in order if f[1] != hint]
     mid = checked_id(wanted)
-    if imap.select("INBOX", readonly=readonly)[0] == "OK":
+    for name, shown in order:
+        if imap.select(name, readonly=readonly)[0] != "OK":
+            continue
         _, data = imap.uid("search", None, "HEADER", "Message-ID", f'"{mid}"')
         uids = data[0].split() if data and data[0] else []
-        if uids:
-            # HEADER matches substrings: take the mail whose id is exactly this one
-            _, rows = imap.uid("fetch", b",".join(uids), "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
-            for r in reversed(rows or []):
-                if isinstance(r, tuple):
-                    got = email.message_from_bytes(r[1]).get("Message-ID")
-                    uid = re.search(rb"UID (\d+)", r[0])
-                    if uid and message_id(got) == mid:
-                        return "INBOX", uid.group(1)
-    raise SystemExit(f"no mail with Message-ID {mid} in INBOX")
+        if not uids:
+            continue
+        # HEADER matches substrings: take the mail whose id is exactly this one
+        _, rows = imap.uid("fetch", b",".join(uids), "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+        for r in reversed(rows or []):
+            if isinstance(r, tuple):
+                got = email.message_from_bytes(r[1]).get("Message-ID")
+                uid = re.search(rb"UID (\d+)", r[0])
+                if uid and message_id(got) == mid:
+                    return shown, uid.group(1)
+    raise SystemExit(f"no mail with Message-ID {mid}")
 
 
 def summary(meta, raw, mine, web, folder=None):
@@ -209,15 +218,118 @@ def summary(meta, raw, mine, web, folder=None):
     return out
 
 
+def criteria(query):
+    """IMAP SEARCH keys for the words: each must be in the sender, subject or
+    text. One word with non-ASCII letters (ü, é…) can be searched too, in the
+    text: imaplib sends it as a literal, after the last key."""
+    keys, literal = [], None
+    for word in query.split():
+        if word.isascii():
+            q = '"' + word.replace("\\", "").replace('"', "") + '"'
+            keys += ["OR", "OR", "FROM", q, "SUBJECT", q, "TEXT", q]
+        elif literal is None:
+            literal = word.encode()
+        else:  # imaplib sends one literal per command
+            print(f"search: “{word}” left out (only one word with non-ASCII letters per server search)",
+                  file=sys.stderr)
+    if literal is not None:
+        keys.append("TEXT")
+    return keys, literal
+
+
+SKIP_FLAGS = ("\\Trash", "\\Junk", "\\Drafts")  # left out of a search unless --all-folders
+SKIP_NAMES = re.compile(r"(?i)^(deleted messages|templates)$")
+PARALLEL = 6  # connections a search uses at once (each folder costs a round trip or two)
+
+
+def search(connect, query, mine, web, limit, all_folders=False):
+    """The newest mails matching the query, in every folder but the trash,
+    spam, drafts and templates (all_folders: those too), searched over
+    PARALLEL connections. Only dates are fetched for all the matches; the
+    newest `limit` then get their headers (no body: no snippet)."""
+    import concurrent.futures
+    import queue
+    keys, literal = criteria(query)
+    if not keys:
+        return []
+    first = connect()
+    todo = [(n, t) for n, t, flags in folders(first)
+            if all_folders or not (any(f in flags for f in SKIP_FLAGS) or SKIP_NAMES.match(t))]
+    pool = queue.Queue()
+    pool.put(first)
+
+    def take():
+        try:
+            return pool.get_nowait()
+        except queue.Empty:
+            return connect()
+
+    def one(folder):
+        name, shown = folder
+        try:
+            imap = take()
+        except (imaplib.IMAP4.error, OSError):
+            return []
+        broken = False
+        try:
+            if imap.select(name, readonly=True)[0] != "OK":
+                return []
+            if literal is not None:
+                imap.literal = literal
+                typ, data = imap.uid("search", "CHARSET", "UTF-8", *keys)
+            else:
+                typ, data = imap.uid("search", None, *keys)
+            uids = data[0].split()[-limit:] if typ == "OK" and data and data[0] else []
+            if not uids:
+                return []
+            _, rows = imap.uid("fetch", b",".join(uids), "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER])")
+            out = []
+            for r in rows:
+                if isinstance(r, tuple):
+                    m = summary(r[0], r[1], mine, web, shown)
+                    when = re.search(rb'INTERNALDATE "([^"]+)"', r[0])
+                    try:
+                        m["_t"] = datetime.datetime.strptime(when.group(1).decode(), "%d-%b-%Y %H:%M:%S %z").timestamp()
+                    except (AttributeError, ValueError):
+                        m["_t"] = 0
+                    out.append(m)
+            return out
+        except (imaplib.IMAP4.error, OSError):  # this folder is left out; the connection too
+            broken = True
+            return []
+        finally:
+            if broken:
+                try:
+                    imap.shutdown()
+                except OSError:
+                    pass
+            else:
+                pool.put(imap)
+
+    found = []
+    with concurrent.futures.ThreadPoolExecutor(PARALLEL) as ex:
+        for part in ex.map(one, todo):
+            found += part
+    while not pool.empty():
+        try:
+            pool.get_nowait().logout()
+        except (imaplib.IMAP4.error, OSError):
+            pass
+    found.sort(key=lambda m: m.pop("_t", 0), reverse=True)
+    return found[:limit]
+
+
 def act(imap, a):
-    """--raw / --delete: one mail in the Inbox, by its Message-ID."""
+    """--raw / --delete: one mail, by its Message-ID, in any folder."""
     if a.raw:
-        _, uid = find(imap, a.raw)
+        _, uid = find(imap, a.raw, hint=a.folder)
         _, rows = imap.uid("fetch", uid, "(BODY.PEEK[])")
         sys.stdout.buffer.write(next(r[1] for r in rows if isinstance(r, tuple)))
         return 0
     trash = trash_folder(imap)
-    _, uid = find(imap, a.delete, readonly=False)
+    folder, uid = find(imap, a.delete, readonly=False, hint=a.folder)
+    if utf7_name(trash.strip('"')) == folder:
+        raise SystemExit(f"it's already in {folder}")
     typ, data = imap.uid("move", uid, trash)
     if typ != "OK":
         raise SystemExit(f"move to {trash} failed: {data}")
@@ -241,6 +353,10 @@ def main():
     one = ap.add_mutually_exclusive_group()
     one.add_argument("--raw", metavar="MESSAGE-ID", help="print that mail whole (not marked read)")
     one.add_argument("--delete", metavar="MESSAGE-ID", help="move that mail to the trash folder")
+    one.add_argument("--search", metavar="WORDS", help="every folder: mails with all the words (sender, subject, text)")
+    ap.add_argument("--limit", type=int, default=50, help="most results for --search (default 50)")
+    ap.add_argument("--folder", help="for --raw/--delete: the folder it's in (as --search shows it), looked in first")
+    ap.add_argument("--all-folders", action="store_true", help="--search the trash, spam, drafts and templates too")
     ap.add_argument("--cache", default=CACHE, help=f"where listed mails are kept whole (default {CACHE}; '' = nowhere)")
     a = ap.parse_args()
     if a.raw and a.cache and os.path.exists(cache_path(a.cache, a.raw)):  # no connection needed
@@ -257,6 +373,11 @@ def main():
         return imap
 
     try:
+        if a.search is not None:
+            found = search(connect, a.search, mine, a.web, a.limit, a.all_folders)
+            print(json.dumps({"query": a.search, "unread": [m for m in found if not m["read"]], "messages": found},
+                             ensure_ascii=False))
+            return 0
         imap = connect()
         if a.raw or a.delete:
             try:

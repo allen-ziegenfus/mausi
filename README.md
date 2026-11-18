@@ -176,6 +176,8 @@ Each of these is off until you configure it:
   command that turns an HTML file into a PNG (the contract is in
   `bin/mausi-mail-view`), `h` shows the mail rendered with kitty's graphics,
   `i` with its remote images, and `f` full screen.
+  In the zoomed Mail section, Enter after `/` searches every folder on the
+  server (the mail command's `--search WORDS`).
 - **`[commands] reminders`**: a command that prints open reminders or to-dos
   from any app as JSON, `{"items": [{"id", "title", "group", "due", "priority",
   "note", "url"}]}` (`due` is `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM`, local, or

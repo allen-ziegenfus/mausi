@@ -1823,9 +1823,32 @@ def mail_task_seed(m):
                         + (f" — {excerpt}{'…' if len(m.get('body') or '') > 400 else ''}" if excerpt else "")]}
 
 
+mail_search = None  # {"query", "busy", "messages", "error"}: S, the zoomed Mail section shows it
+
+
+def start_mail_search(query):
+    """S: every folder searched on the server (the mail command's --search)."""
+    global mail_search
+    mail_search = {"query": query, "busy": True, "messages": [], "error": ""}
+    mine = mail_search
+
+    def run():
+        try:
+            r = subprocess.run(MAIL_CMD + ["--search", query], capture_output=True, text=True, timeout=120)
+            mine["messages"] = cfg.clean(json.loads(r.stdout)).get("messages", []) if r.returncode == 0 else []
+            if r.returncode != 0:
+                mine["error"] = (r.stderr.strip().splitlines() or ["search failed"])[-1][:100]
+        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+            mine["error"] = str(e)[:100]
+        mine["busy"] = False
+    threading.Thread(target=run, daemon=True).start()
+
+
 def mail_lines(detail=False, width=None):
     with lock:
         data = mail
+    if detail and mail_search:
+        return mail_search_lines()
     head = f"{BOLD}Mail{RESET}"
     if data is None:
         return [(head, None)] + LOADING
@@ -2054,6 +2077,28 @@ def complete_reminder(rid, title):
     if ctx:
         ctx.refresh("reminders")
     return f"done: {title[:60]}"
+
+
+def mail_search_lines():
+    q = mail_search
+    head = f"{BOLD}Mail{RESET} {CYAN}search “{q['query']}”{RESET}"
+    if q["busy"]:
+        return [(f"{head} {DIM}searching every folder…{RESET}", None)]
+    if q["error"]:
+        return [(f"{head} {RED}{q['error']}{RESET}", None)]
+    lines = [(f"{head} {DIM}({len(q['messages'])} found, newest first · / searches again · Esc back to the Inbox){RESET}", None)]
+    for m in q["messages"]:
+        star = (f"{CYAN}●{RESET}" if not m.get("read") else " ") + (f"{YELLOW}★{RESET}" if m.get("starred") else " ")
+        color = DIM if m["list"] or not m["to_me"] or m.get("read") else ""
+        action = {"open": m["url"], "message_id": m.get("message_id"), "subject": m["subject"],
+                  "task_seed": mail_task_seed(m),
+                  "detail": (f"{m['from']} · {m['date'].replace('T', ' ')} · {m.get('folder', '')}",
+                             m["subject"] + ("\n\n" + m["body"] if m.get("body") else ""))}
+        lines.append((f"  {DIM}{m['date'][:10]}{RESET} {star} {DIM}{fit(m.get('folder', ''), 10)}{RESET} "
+                      f"{color}{fit(m['from'], 22)} {color}{m['subject']}{RESET}", action))
+    if not q["messages"]:
+        lines.append((f"  {DIM}nothing found{RESET}", None))
+    return lines
 
 
 TRIAGE_MARK = {"now": (RED, "●"), "today": (YELLOW, "●"), "soon": (DIM, "○")}
@@ -2826,10 +2871,18 @@ class Ui:
         if v == 3:
             self.tview = 3
 
+        mail_zoom = self.zoom == "mail" and MAIL_CMD
+
         def done(text):  # Enter keeps the filter and the match ↑↓ chose
+            if mail_zoom and text:  # in Mail, Enter also searches every folder on the server
+                start_mail_search(text)
+                self.search = ""
+                self.selected[2] = self.offset[2] = 0
+                return f"searching every folder for “{text}”…"
             self.search = text
             return ""
-        self.prompt = {"label": "/", "text": self.search, "done": done, "live": True}
+        self.prompt = {"label": "/ (Enter: search every folder)" if mail_zoom else "/", "text": self.search,
+                       "done": done, "live": True}
 
     def search_edited(self):
         """The search text changed: start again at the first match."""
@@ -3168,7 +3221,8 @@ def _mail_worker(message_id, path, render, network):
         v = viewer_module()
         info = _mail_info.get(message_id)
         if info is None:
-            r = subprocess.run(MAIL_CMD + [f"--raw={message_id}"], capture_output=True, timeout=60)
+            r = subprocess.run(MAIL_CMD + [f"--raw={message_id}"] + mail_folder_args(message_id),
+                               capture_output=True, timeout=60)
             if r.returncode != 0 or not r.stdout:
                 _preview["failed"][key] = time.time()
                 return
@@ -3276,13 +3330,24 @@ def view_mail(message_id):
     return ""
 
 
+def mail_folder_args(message_id):
+    """--folder for a search result outside the Inbox: found at once."""
+    for m in (mail_search or {}).get("messages", []):
+        if m.get("message_id") == message_id and m.get("folder") and m["folder"] != "INBOX":
+            return ["--folder", m["folder"]]
+    return []
+
+
 def delete_mail(message_id, subject):
     try:
-        r = subprocess.run(MAIL_CMD + [f"--delete={message_id}"], capture_output=True, text=True, timeout=30)
+        r = subprocess.run(MAIL_CMD + [f"--delete={message_id}"] + mail_folder_args(message_id),
+                           capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired:
         return "no answer from the mail server in 30 s: it may or may not be deleted"
     if r.returncode != 0:
         return f"couldn't delete it: {(r.stderr or r.stdout).strip()[:80]}"
+    if mail_search:
+        mail_search["messages"] = [m for m in mail_search["messages"] if m.get("message_id") != message_id]
     with lock:
         if mail:
             for key in ("unread", "messages"):
@@ -3406,7 +3471,8 @@ Tasks
 Search (task view and zoomed sections)
   /               type to filter; every word must match (titles, ids, keys, notes)
   ↑↓              move through the matches while typing
-  Enter           keep the filter and stay on the match
+  Enter           keep the filter and stay on the match · in Mail: search every
+                  folder on the server instead (Esc goes back to the Inbox)
   Esc             clear the filter, staying on the same entry
 
 Notes and more
@@ -3660,7 +3726,7 @@ def main():
             pa = ui.popup[2] if ui.popup else {}
             loading = ((pa.get("issue") and issue_data(pa["issue"]) is None)
                        or (pa.get("pr") and detail_data(pr_path(pa["pr"])) is None))
-            loading = loading or bool(_preview["busy"])  # a mail preview is on its way
+            loading = loading or bool(_preview["busy"]) or bool(mail_search and mail_search["busy"])
             ready, _, _ = select.select([sys.stdin], [], [], 0.3 if loading else SESSION_REFRESH)
             if not ready:
                 continue
@@ -3806,6 +3872,10 @@ def _process_key(ui, key, wakes):
         return False
     if ui.pick and key in ("\033", "q"):
         ui.end_pick("cancelled")
+        return False
+    if ui.zoom == "mail" and mail_search and key == "\033":  # out of the search, still in Mail
+        globals()["mail_search"] = None
+        ui.selected[2] = ui.offset[2] = 0
         return False
     if ui.zoom and key in ("\033", "q", "z"):
         ui.toggle_zoom()
