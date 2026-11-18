@@ -459,9 +459,12 @@ def write(state):
     """Write state ({name: entry}) to CONTEXT, readable only by me."""
     doc = {"version": VERSION, "written": time.time(), "collector": os.getpid(),
            "sources": {name: state[name] for name in SOURCES if name in state}}
+    folder = os.path.dirname(CONTEXT)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    os.chmod(folder, 0o700)  # mail, calendar and Slack text live here
     if not os.path.exists(CONTEXT):
-        os.makedirs(os.path.dirname(CONTEXT), exist_ok=True)
         os.close(os.open(CONTEXT, os.O_WRONLY | os.O_CREAT, 0o600))
+    os.chmod(CONTEXT, 0o600)  # write_atomic keeps the mode: make sure it's this one
     cfg.write_atomic(CONTEXT, json.dumps(doc, separators=(",", ":")))
 
 
