@@ -153,6 +153,14 @@ Each of these is off until you configure it:
   `bin/mausi-todos FILE...` shows TODO files the same way: each file's open
   items under their headings (Enter opens the file at the item). `command` can
   be a list; the commands' output is merged.
+- **`[projects]`**: folders you work on often, in named groups
+  (`personal = ["~/src/app", "~/src/tools-*", "~/src/{a,b}"]`). Adds the Projects
+  section to Now: each folder's git state (branch, uncommitted changes, last
+  commit), its worktrees and the open tasks linked to it (`repos:` or
+  `code/`). It lists the ones without a session (Sessions has the rest); z
+  shows all. Enter goes to the folder's session, or starts Claude there in a
+  new tab, continuing its last conversation; s opens a shell. Plain folders
+  work too, without the git part.
 - **`[commands] calendar`**: a command that prints today's meetings as JSON:
   `{"events": [{"title", "start": "YYYY-MM-DDTHH:MM", "end", "allday", "location", "meet"}], "synced": "…"}`.
   It gets an optional `YYYY-MM-DD` argument for another day. Adds the Today section and meeting reminders.

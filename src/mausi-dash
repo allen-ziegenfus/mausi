@@ -167,6 +167,8 @@ if not cfg.BOARD:  # the collector never fetches a board then: Tasks reads the o
 meetings = {"events": [], "synced": None, "error": None}
 meetings_tomorrow = {"events": []}
 mail = None  # the mail command's output: Inbox mail (all of it in zoom, unread otherwise)
+projects_data = None  # the projects source: {"groups": [{"name", "projects": [...]}]}
+PROJECTS_MAX = 6  # rows per group in the dashboard; zoom shows them all
 reminders = None  # the reminders command's output: {"items": [...]} (due ones here, all in zoom)
 REMINDERS_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "reminders")))
 PIN_HEAD = "\033[1;30;43m"  # bold black on yellow, for the pinned Now tasks
@@ -1935,6 +1937,108 @@ def add_reminder(text):
     return f"added: {title[:50]}" + (f" in {group}" if group else "") + (f", due {due}" if due else "")
 
 
+def ago(epoch):
+    if not epoch:
+        return "—"
+    s = max(0, time.time() - epoch)
+    return (f"{int(s // 60)}m" if s < 3600 else f"{int(s // 3600)}h" if s < 86400
+            else f"{int(s // 86400)}d" if s < 60 * 86400 else f"{int(s // (30 * 86400))}mo")
+
+
+def session_in(path, rows):
+    """The session row running in path (or a folder under it), the deepest
+    match first, so a worktree inside its repo isn't claimed by the repo."""
+    best, depth = None, -1
+    for r in rows:
+        cwd = r.get("cwd_real") or os.path.realpath(r.get("cwd_full") or "")
+        if (cwd == path or cwd.startswith(path + os.sep)) and len(cwd) > depth:
+            best, depth = r, len(cwd)
+    return best
+
+
+def project_action(p, row):
+    """Enter on a project or worktree: its session if one is open, else Claude
+    in a new tab there (continuing the folder's last conversation)."""
+    action = {"shell": ["--cwd", p["path"]], "name": p["name"],
+              "detail": (p["path"], f"{p['path']}\n\n" + (f"branch {p['branch']} · {p['changes']} uncommitted"
+                                                           if p["git"] else "not a git repo")
+                         + f" · last change {ago(p['last'])} ago"
+                         + "".join(f"\n{t['id']} {t['title']}" for t in p.get("tasks", [])))}
+    if row:
+        action.update({"tab": row["tab_id"], "sid": row["sid_full"], "cwd": row["cwd_full"],
+                       "session": row.get("title") or p["name"],
+                       "outside": ({"pid": row["pid"], "where": row["where"], "age": row["age"]}
+                                   if row.get("where") else None)})
+    else:
+        action["claude_dir"] = p["path"]
+    return action
+
+
+PROJECT_COLS = (24, 4, 18, 4, 5, 9)  # folder, last, branch, uncommitted, tasks, worktrees
+
+
+def project_row(p, row, indent, detail):
+    """One folder as fixed columns under the header row (padded before
+    colouring, so the escape codes don't shift them)."""
+    w_name, w_last, w_branch, w_changes, w_tasks, w_wt = PROJECT_COLS
+    mark = f"{CYAN}›{RESET}" if row else " "
+    branch = (p["branch"] if p["branch"] not in ("main", "master") else "") if p["git"] else "no git"
+    if p["git"] and p["branch"] == "HEAD":
+        branch = f"detached {p.get('commit', '')}".strip()
+    elif p["git"] and not p["branch"]:
+        branch = "no commits"
+    branch_col = f"{fit(branch, w_branch):<{w_branch}}"
+    changes = f"●{p['changes']}" if p["changes"] else ""
+    tasks = str(len(p["tasks"])) if p.get("tasks") else ""
+    wts = f"+{len(p['worktrees'])}" if not detail and p.get("worktrees") else ""
+    where = ""
+    if row:
+        where = f"  {DIM}session in {'tab ' + str(row['tab']) if row.get('tab') else row.get('where')}{RESET}"
+    name_w = w_name - (len(indent) - 2)  # worktrees sit deeper; keep the columns where they are
+    return (f"{indent}{mark} {fit(p['name'], name_w):<{name_w}} {DIM}{ago(p['last']):>{w_last}}{RESET}  "
+            f"{(MAGENTA if p['git'] else DIM)}{branch_col}{RESET} "
+            f"{YELLOW}{changes:>{w_changes}}{RESET} {CYAN}{tasks:>{w_tasks}}{RESET} {DIM}{wts:>{w_wt}}{RESET}{where}",
+            project_action(p, row))
+
+
+def projects_lines(rows, detail=False, width=None):
+    """Projects: the [projects] folders, the most recently changed first. Here
+    only those without a session (Sessions lists the rest); zoomed, all of them
+    with their worktrees and open tasks."""
+    with lock:
+        data = projects_data
+    head = f"{BOLD}Projects{RESET}"
+    if data is None:
+        return [(head, None)] + LOADING
+    if data["error"]:
+        return [(f"{head} {RED}{data['error']}{RESET}", None)]
+    rows = [dict(r, cwd_real=os.path.realpath(r.get("cwd_full") or "")) for r in rows]  # once per draw
+    lines = [(f"{head} {DIM}(Enter: its session or Claude there · s shell"
+              + ("" if detail else " · z for all") + f"){RESET}", None),
+             (f"{DIM}    {'folder':<{PROJECT_COLS[0]}} {'last':>{PROJECT_COLS[1]}}  {'branch':<{PROJECT_COLS[2]}} "
+              f"{'files':>{PROJECT_COLS[3]}} {'tasks':>{PROJECT_COLS[4]}}"
+              + ("" if detail else f" {'worktrees':>{PROJECT_COLS[5]}}") + f"{RESET}", None)]
+    for g in data["groups"]:
+        ps = sorted(g["projects"], key=lambda p: -p["last"])
+        if not detail:
+            ps = [p for p in ps if not session_in(p["path"], rows)
+                  and not any(session_in(w["path"], rows) for w in p.get("worktrees", []))]
+        more = len(ps) - PROJECTS_MAX if not detail and len(ps) > PROJECTS_MAX else 0
+        lines.append((f"  {CYAN}{g['name']}{RESET}" + (f" {DIM}(+{more} more){RESET}" if more else ""), None))
+        for p in ps[:PROJECTS_MAX] if more else ps:
+            lines.append(project_row(p, session_in(p["path"], rows) if detail else None, "  ", detail))
+            if not detail:
+                continue
+            for w in p.get("worktrees", []):
+                lines.append(project_row(dict(w, name="↳ " + w["name"]), session_in(w["path"], rows), "      ", detail))
+            for t in p.get("tasks", []) + [t for w in p.get("worktrees", []) for t in w.get("tasks", [])]:
+                lines.append((f"        {DIM}·{RESET} {BOLD}{t['id']}{RESET} {t['title']}",
+                              {"task": t["title"], "task_ref": t["id"]}))
+        if not ps:
+            lines.append((f"    {DIM}all have a session open{RESET}", None))
+    return lines
+
+
 def complete_reminder(rid, title):
     try:
         r = subprocess.run(REMINDERS_CMD + ["--complete", rid], capture_output=True, text=True, timeout=10)
@@ -2442,6 +2546,8 @@ def _section_lines(name, rows, detail=False, width=None, history=False):
         return mail_lines(detail, width)
     if name == "reminders":
         return reminder_lines(detail, width)
+    if name == "projects":
+        return projects_lines(rows, detail, width)
     if name == "slack":
         return slack_lines(detail, width)
     if name in ("docker", "kube"):
@@ -2469,19 +2575,19 @@ def _section_lines(name, rows, detail=False, width=None, history=False):
     return []
 
 
-VIEW_SECTIONS = {"Now": ("you", "today", "needs", "reminders", "sessions", "pinned", "tasks", "docker", "kube"),
+VIEW_SECTIONS = {"Now": ("you", "today", "needs", "reminders", "sessions", "projects", "pinned", "tasks", "docker", "kube"),
                  "Work": ("slack", "notifications", "mail", "notes", "prs", "boards", "jira", "jira_created", "recent")}
 # Sections whose source isn't set up are left out: the board (PRs, Jira), the
 # calendar and mail commands, and the notification log (Linux capture).
 _SOURCE = {"today": bool(cfg.get("commands", "calendar")), "mail": bool(cfg.get("commands", "mail")),
-           "reminders": bool(REMINDERS_CMD),
+           "reminders": bool(REMINDERS_CMD), "projects": bool(cfg.config().get("projects")),
            "prs": cfg.BOARD, "boards": cfg.BOARD, "jira": cfg.BOARD, "jira_created": cfg.BOARD, "recent": cfg.BOARD,
            "needs": bool(cfg.get("triage", "enabled")),
            "slack": os.path.exists(NOTIFICATIONS) or bool(cfg.get("notifications", "capture")),
            "notifications": os.path.exists(NOTIFICATIONS) or bool(cfg.get("notifications", "capture")),
            "docker": bool(shutil.which("docker")), "kube": bool(shutil.which("kubectl") or shutil.which("k3d"))}
 VIEW_SECTIONS = {view: tuple(n for n in names if _SOURCE.get(n, True)) for view, names in VIEW_SECTIONS.items()}
-SECTION_TITLES = {"you": "You", "today": "Today", "needs": "Needs you", "reminders": "Reminders", "sessions": "Sessions", "docker": "Docker", "kube": "Kubernetes",
+SECTION_TITLES = {"you": "You", "today": "Today", "needs": "Needs you", "reminders": "Reminders", "projects": "Projects", "sessions": "Sessions", "docker": "Docker", "kube": "Kubernetes",
                   "notifications": "Notifications", "slack": "Slack", "mail": "Mail", "notes": "Notes", "prs": "PRs", "boards": "Boards", "jira": "Jira: assigned to me", "jira_created": "Jira: created by me", "recent": "Recently closed", "tasks": "Tasks",
                   "pinned": "Now (pinned tasks)"}
 
@@ -2936,12 +3042,33 @@ class Ui:
         sys.stdout.flush()
 
 
+_launched = {}  # folder -> when Enter on Projects started Claude there
+LAUNCH_GRACE = 15  # seconds
+
+
 def perform(action, verb="open"):
     if not action:
         return
     if verb == "open" and action.get("dir"):  # a task's worktree: a shell tab there
         subprocess.run(["kitty", "@", "launch", "--type=tab", "--tab-title", os.path.basename(action["dir"]),
                         "--cwd", action["dir"]], capture_output=True)
+    elif verb == "open" and action.get("claude_dir"):
+        path = action["claude_dir"]
+        name = os.path.basename(path)
+        # Two processes on one conversation corrupt it: no second launch while
+        # the first tab isn't in Sessions yet, and none at all when a session
+        # already runs in that folder (Sessions refreshes only every few seconds).
+        if time.time() - _launched.get(path, 0) < LAUNCH_GRACE:
+            return f"Claude is starting in {name}"
+        if any(os.path.realpath(cwd) == path for _, cwd, _ in snapshots.live_records()):
+            return f"a Claude session already runs in {name}: it'll show in Sessions"
+        _launched[path] = time.time()
+        proj = os.path.join(PROJECTS, re.sub(r"[^A-Za-z0-9]", "-", path))
+        had = os.path.isdir(proj) and any(f.endswith(".jsonl") for f in os.listdir(proj))
+        subprocess.run(["kitty", "@", "launch", "--type=tab", "--tab-title", f"💬 {name}", "--cwd", path,
+                        "--var", f"claude_title={name}", "claude", *(["--continue"] if had else [])],
+                       capture_output=True)
+        return f"Claude in {name}" + (" (its last conversation)" if had else "")
     elif verb == "open" and action.get("tab"):
         subprocess.run(["kitty", "@", "focus-tab", "--match", f"id:{action['tab']}"],
                        capture_output=True)
@@ -3207,7 +3334,7 @@ class Wake:
 
 def on_context(name, entry):
     """A source has new data: hand it to the section globals the views read."""
-    global work_data, infra_data, mail, reminders, meetings, meetings_tomorrow
+    global work_data, infra_data, mail, reminders, projects_data, meetings, meetings_tomorrow
     data, error = entry.get("data"), entry.get("error")
     with lock:
         # An error shows as before, in place of the section; the collector
@@ -3218,6 +3345,8 @@ def on_context(name, entry):
             infra_data = data
         elif name == "mail":
             mail = {"unread": [], "error": error} if error or data is None else dict(data, error=None)
+        elif name == "projects":
+            projects_data = {"groups": [], "error": error} if error or data is None else dict(data, error=None)
         elif name == "reminders":
             reminders = {"items": [], "error": error} if error or data is None else dict(data, error=None)
         elif name == "calendar":

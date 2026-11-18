@@ -20,6 +20,7 @@ Whoever holds the lock on CONTEXT + ".lock" is the collector:
 port); a dashboard started next to it only reads.
 """
 import fcntl
+import glob
 import html
 import json
 import os
@@ -121,6 +122,99 @@ def fetch_reminders(hard=False):
     if isinstance(data.get("digest"), list):  # what the command gives triage
         out.update(digest=[str(x) for x in data["digest"]], digest_title=str(data.get("digest_title") or ""))
     return out, None
+
+
+def git(path, *args, timeout=5):
+    # --no-optional-locks: status here must never hold index.lock while I commit
+    out = run(["git", "--no-optional-locks", "-C", path, *args], timeout)
+    return out.strip() if out is not None else None
+
+
+def folder_state(path):
+    """{path, name, git, branch, commit, changes, last}: last is the newest
+    commit (git) or the newest top-level change (a plain folder), epoch
+    seconds. A folder is a repo only at its top: a plain folder inside some
+    other repo (a dotfiles home, say) stays plain."""
+    out = {"path": path, "name": os.path.basename(path), "git": False, "branch": "", "commit": "",
+           "changes": 0, "last": 0}
+    top = git(path, "rev-parse", "--show-toplevel")
+    if top and os.path.realpath(top) == path:
+        status = (git(path, "status", "--porcelain=v2", "--branch") or "").splitlines()
+        head = next((l[14:] for l in status if l.startswith("# branch.head ")), "")
+        oid = next((l[13:] for l in status if l.startswith("# branch.oid ")), "")
+        last = git(path, "log", "-1", "--format=%ct") if oid != "(initial)" else ""
+        out.update(git=True, branch="HEAD" if head == "(detached)" else "" if oid == "(initial)" else head,
+                   commit=oid[:8] if oid != "(initial)" else "",
+                   changes=sum(1 for l in status if not l.startswith("#")),
+                   last=int(last) if last and last.isdigit() else 0)
+        if out["changes"] or not out["last"]:  # uncommitted work counts as activity
+            out["last"] = max(out["last"], _mtime(path))
+    else:
+        out["last"] = _mtime(path)
+    return out
+
+
+def _mtime(path):
+    try:
+        entries = [os.path.join(path, n) for n in os.listdir(path) if n != ".git"]
+        return int(max([os.lstat(p).st_mtime for p in entries] + [os.stat(path).st_mtime]))
+    except OSError:
+        return 0
+
+
+def braces(pattern):
+    """Shell-style {a,b} alternatives, which glob doesn't do."""
+    m = re.search(r"\{([^{}]*)\}", pattern)
+    if not m:
+        return [pattern]
+    return [x for alt in m.group(1).split(",") for x in braces(pattern[:m.start()] + alt + pattern[m.end():])]
+
+
+def fetch_projects(hard=False):
+    """[projects] folders: per group, each folder's git state, its worktrees,
+    and the open tasks linked to them (repos: or code/ links)."""
+    import mausi_tasks  # here: only the collector needs it
+    links = {}  # real path -> [(task id, title)]
+    for t in mausi_tasks.load_all():
+        if t.get("status") != "open":
+            continue
+        targets = set(mausi_tasks.task_repos(t).values())
+        code = os.path.join(os.path.dirname(t["path"]), mausi_tasks.CODE)
+        if os.path.isdir(code):
+            targets |= {os.path.realpath(os.path.join(code, n)) for n in os.listdir(code)}
+        for p in targets:
+            links.setdefault(p, []).append({"id": t["id"], "title": t.get("title", "")})
+    groups = []
+    for name, patterns in (cfg.config().get("projects") or {}).items():
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        paths = []
+        for pat in patterns:
+            for p in sorted(g for b in braces(os.path.expanduser(str(pat))) for g in glob.glob(b)):
+                p = os.path.realpath(p)
+                if os.path.isdir(p) and p not in paths:
+                    paths.append(p)
+        groups.append({"name": name, "paths": paths})
+    listed = {p for g in groups for p in g["paths"]}
+    for g in groups:
+        projects = []
+        for p in g.pop("paths"):
+            state = folder_state(p)
+            state["tasks"] = links.get(p, [])
+            state["worktrees"] = []
+            if state["git"]:
+                # The repo's other checkouts (the main one included, when p is
+                # a worktree); those listed as projects themselves stay out.
+                for block in (git(p, "worktree", "list", "--porcelain") or "").split("\n\n"):
+                    wt = next((l[9:] for l in block.splitlines() if l.startswith("worktree ")), None)
+                    wt = os.path.realpath(wt) if wt else None
+                    if wt and wt != p and wt not in listed and os.path.isdir(wt):
+                        w = folder_state(wt)
+                        w["tasks"] = links.get(w["path"], [])
+                        state["worktrees"].append(w)
+            projects.append(state)
+        g["projects"] = projects
+    return {"groups": groups}, None
 
 
 def fetch_calendar(hard=False):
@@ -315,6 +409,7 @@ SOURCES = {
     "mail": (fetch_mail, 120, bool(MAIL_CMD)),
     "calendar": (fetch_calendar, 120, bool(CALENDAR_CMD)),
     "reminders": (fetch_reminders, 120, bool(REMINDERS_CMD)),
+    "projects": (fetch_projects, 60, bool(cfg.config().get("projects"))),
     "notifications": (fetch_notifications, 2, True),  # cheap: re-read only when the log changes
     "infra": (fetch_infra, 15, True),
     "sessions": (fetch_sessions, 15, True),

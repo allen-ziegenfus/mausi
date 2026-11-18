@@ -102,6 +102,8 @@ DEFAULTS = {
         "forward_owner": "",                # GitHub owner whose repo PRs are forwarded to for the final review
         "forward_name": "",                 # who that is, for labels ("waiting on <name>")
     },
+    "projects": {},                         # Projects section: group name = [folders or globs], e.g.
+                                            # personal = ["~/src/app", "~/src/tools-*"]
     "commands": {
         "calendar": "",                     # prints today's meetings as JSON (optional arg: YYYY-MM-DD)
         "mail": "",                         # prints unread mail as JSON
