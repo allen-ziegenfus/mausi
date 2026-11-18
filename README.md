@@ -158,6 +158,8 @@ Each of these is off until you configure it:
   It gets an optional `YYYY-MM-DD` argument for another day. Adds the Today section and meeting reminders.
 - **`[commands] mail`**: a command that prints unread mail as JSON
   (`{"unread": [...]}`; see `mail_lines` in `mausi-dash`). `mail_open` opens one.
+  `bin/mausi-mail --host imap.example.com --user me@example.com` reads the
+  Inbox over IMAP (read-only), with the password in the macOS Keychain.
 - **`[commands] worktree`**: creates or opens a ticket's worktree (`w` key).
 - **`[notifications] capture = true`** (Linux): the dashboard runs
   `mausi-notif-capture`, which logs every desktop notification from D-Bus, for

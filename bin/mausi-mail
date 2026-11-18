@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""mausi-mail: the Inbox over IMAP, for mausi's [commands] mail. Read-only:
+nothing is marked read. Python 3.9+, standard library only.
+
+    mausi-mail --host imap.example.com --user me@example.com [--me alias@example.com] [--web URL]
+
+The password comes from the macOS Keychain (service --keychain, default
+"mausi-mail"; account = --user); add it once with
+
+    security add-generic-password -s mausi-mail -a me@example.com -w
+
+(it asks for the password; use an app password if the account has 2FA), or
+from $MAUSI_MAIL_PASSWORD. Prints {"unread": [...], "messages": [...]}: the
+last --days days of the Inbox (default 14), newest first, in the fields
+mausi's Mail section reads.
+"""
+import argparse
+import datetime
+import email
+import email.header
+import email.utils
+import imaplib
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+
+MAX = 60  # messages fetched at most
+
+
+def password(user, service):
+    if os.environ.get("MAUSI_MAIL_PASSWORD"):
+        return os.environ["MAUSI_MAIL_PASSWORD"]
+    r = subprocess.run(["security", "find-generic-password", "-s", service, "-a", user, "-w"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit(f"no password: add it with  security add-generic-password -s {service} -a {user} -w")
+    return r.stdout.rstrip("\n")
+
+
+def text(value):
+    parts = []
+    for chunk, charset in email.header.decode_header(value or ""):
+        if isinstance(chunk, bytes):
+            try:
+                chunk = chunk.decode(charset or "utf-8", "replace")
+            except LookupError:  # a charset Python doesn't know
+                chunk = chunk.decode("utf-8", "replace")
+        parts.append(chunk)
+    return re.sub(r"\s+", " ", "".join(parts)).strip()
+
+
+def snippet(msg, limit=600):
+    """The start of the plain-text body (or the HTML with tags stripped)."""
+    for want in ("text/plain", "text/html"):
+        for part in msg.walk():
+            if part.get_content_type() == want and not part.get_filename():
+                try:
+                    body = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", "replace")
+                except (AttributeError, LookupError):
+                    continue
+                if want == "text/html":
+                    body = re.sub(r"(?is)<(script|style).*?</\1>|<[^>]+>", " ", body)
+                    body = re.sub(r"&nbsp;|&#160;", " ", body)
+                return re.sub(r"\s+", " ", body).strip()[:limit]
+    return ""
+
+
+def main():
+    ap = argparse.ArgumentParser(description="The Inbox over IMAP as mausi's mail JSON.")
+    ap.add_argument("--host", required=True)
+    ap.add_argument("--port", type=int, default=993)
+    ap.add_argument("--user", required=True)
+    ap.add_argument("--keychain", default="mausi-mail", help="Keychain service the password is under (default mausi-mail)")
+    ap.add_argument("--me", action="append", default=[], help="another address of mine, for 'to me' (repeatable)")
+    ap.add_argument("--days", type=int, default=14)
+    ap.add_argument("--web", default="", help="URL the mail opens at (the webmail), e.g. https://mail.example.com")
+    a = ap.parse_args()
+    mine = {a.user.lower(), *(m.lower() for m in a.me)}
+
+    try:
+        imap = imaplib.IMAP4_SSL(a.host, a.port, ssl_context=ssl.create_default_context(), timeout=30)
+        imap.login(a.user, password(a.user, a.keychain))
+        imap.select("INBOX", readonly=True)
+        since = (datetime.date.today() - datetime.timedelta(days=a.days)).strftime("%d-%b-%Y")
+        _, data = imap.uid("search", None, "SINCE", since)
+        uids = data[0].split()[-MAX:]
+        messages = []
+        if uids:
+            _, rows = imap.uid("fetch", b",".join(uids), "(UID FLAGS BODY.PEEK[]<0.20000>)")
+            for row in rows:
+                if not isinstance(row, tuple):
+                    continue
+                meta, raw = row
+                flags = re.search(rb"FLAGS \(([^)]*)\)", meta)
+                flags = flags.group(1).decode() if flags else ""
+                msg = email.message_from_bytes(raw)
+                try:
+                    when = email.utils.parsedate_to_datetime(msg["Date"]).astimezone()
+                except (TypeError, ValueError):
+                    when = datetime.datetime.now().astimezone()
+                name, addr = email.utils.parseaddr(text(msg["From"]))
+                to = {x[1].lower() for x in email.utils.getaddresses([text(msg.get("To")), text(msg.get("Cc"))])}
+                messages.append({
+                    "from": name or addr, "from_addr": addr, "subject": text(msg["Subject"]) or "(no subject)",
+                    "date": when.strftime("%Y-%m-%dT%H:%M"), "read": "\\Seen" in flags, "starred": "\\Flagged" in flags,
+                    "list": bool(msg.get("List-Id") or msg.get("List-Unsubscribe")), "to_me": bool(to & mine),
+                    "message_id": (msg.get("Message-ID") or "").strip("<> "), "url": a.web, "body": snippet(msg)})
+        imap.logout()
+    except (imaplib.IMAP4.error, OSError) as e:
+        print(f"IMAP {a.host}: {e}", file=sys.stderr)
+        return 1
+    messages.sort(key=lambda m: m["date"], reverse=True)
+    print(json.dumps({"unread": [m for m in messages if not m["read"]], "messages": messages}, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
