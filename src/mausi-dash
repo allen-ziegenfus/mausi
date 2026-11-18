@@ -1503,13 +1503,15 @@ def pr_lines(data, detail=False):
     return lines
 
 
-def project_lines(data, detail=False):
-    """Project boards (the board's "projects", e.g. GitHub Projects from
-    mausi-github): the items in the moving statuses, with a count of the rest."""
-    if data.get("error") or "projects" not in data:  # the PRs section shows the error
+def board_lines(data, detail=False):
+    """Boards (the board's "boards", e.g. GitHub Projects from mausi-github or
+    TODO files from mausi-todos): the items in the moving statuses, with a count
+    of the rest. "projects" is the key's old name."""
+    key = "boards" if "boards" in data else "projects"
+    if data.get("error") or key not in data:  # the PRs section shows the error
         return []
     lines = []
-    for p in data.get("projects") or []:
+    for p in data.get(key) or []:
         rest = ", ".join(f"{n} {s}" for s, n in sorted(p["counts"].items(),
                          key=lambda kv: p["statuses"].index(kv[0]) if kv[0] in p["statuses"] else 99) if s not in p["shown"])
         if lines:
@@ -1535,7 +1537,7 @@ def project_lines(data, detail=False):
                 lines += sub(f"{i['ref']} · updated {i['updated']}" + (f" · {', '.join(i['assignees'])}" if i["assignees"] else ""))
     for e in data.get("board_errors") or []:  # a board command that failed while the others worked
         lines.append((f"  {RED}{e[:120]}{RESET}", None))
-    return lines or [(f"{BOLD}Projects{RESET} {DIM}none{RESET}", None)]
+    return lines or [(f"{BOLD}Boards{RESET} {DIM}none{RESET}", None)]
 
 
 def why_tag(pr):
@@ -2452,8 +2454,8 @@ def _section_lines(name, rows, detail=False, width=None, history=False):
         return [] if name == "pinned" else [(f"{BOLD}{name.capitalize()}{RESET}", None)] + LOADING
     if name == "prs":
         return pr_lines(work, detail)
-    if name == "projects":
-        return project_lines(work, detail)
+    if name == "boards":
+        return board_lines(work, detail)
     if name == "jira":
         return jira_lines(work, detail, width)
     if name == "jira_created":
@@ -2468,19 +2470,19 @@ def _section_lines(name, rows, detail=False, width=None, history=False):
 
 
 VIEW_SECTIONS = {"Now": ("you", "today", "needs", "reminders", "sessions", "pinned", "tasks", "docker", "kube"),
-                 "Work": ("slack", "notifications", "mail", "notes", "prs", "projects", "jira", "jira_created", "recent")}
+                 "Work": ("slack", "notifications", "mail", "notes", "prs", "boards", "jira", "jira_created", "recent")}
 # Sections whose source isn't set up are left out: the board (PRs, Jira), the
 # calendar and mail commands, and the notification log (Linux capture).
 _SOURCE = {"today": bool(cfg.get("commands", "calendar")), "mail": bool(cfg.get("commands", "mail")),
            "reminders": bool(REMINDERS_CMD),
-           "prs": cfg.BOARD, "projects": cfg.BOARD, "jira": cfg.BOARD, "jira_created": cfg.BOARD, "recent": cfg.BOARD,
+           "prs": cfg.BOARD, "boards": cfg.BOARD, "jira": cfg.BOARD, "jira_created": cfg.BOARD, "recent": cfg.BOARD,
            "needs": bool(cfg.get("triage", "enabled")),
            "slack": os.path.exists(NOTIFICATIONS) or bool(cfg.get("notifications", "capture")),
            "notifications": os.path.exists(NOTIFICATIONS) or bool(cfg.get("notifications", "capture")),
            "docker": bool(shutil.which("docker")), "kube": bool(shutil.which("kubectl") or shutil.which("k3d"))}
 VIEW_SECTIONS = {view: tuple(n for n in names if _SOURCE.get(n, True)) for view, names in VIEW_SECTIONS.items()}
 SECTION_TITLES = {"you": "You", "today": "Today", "needs": "Needs you", "reminders": "Reminders", "sessions": "Sessions", "docker": "Docker", "kube": "Kubernetes",
-                  "notifications": "Notifications", "slack": "Slack", "mail": "Mail", "notes": "Notes", "prs": "PRs", "projects": "Projects", "jira": "Jira: assigned to me", "jira_created": "Jira: created by me", "recent": "Recently closed", "tasks": "Tasks",
+                  "notifications": "Notifications", "slack": "Slack", "mail": "Mail", "notes": "Notes", "prs": "PRs", "boards": "Boards", "jira": "Jira: assigned to me", "jira_created": "Jira: created by me", "recent": "Recently closed", "tasks": "Tasks",
                   "pinned": "Now (pinned tasks)"}
 
 

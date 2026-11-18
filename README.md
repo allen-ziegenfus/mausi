@@ -144,11 +144,11 @@ Each of these is off until you configure it:
 - **`[board] url`**: a local HTTP service serving `/api/dash.json` with your
   PRs and Jira issues. It adds the PR and Jira sections. mausi doesn't include
   a board; the shape it expects is in `mausi-dash` (`pr_lines`, `jira_lines`,
-  `project_lines`). Sections whose key the board doesn't send stay hidden.
+  `board_lines`). Sections whose key the board doesn't send stay hidden.
 - **`[board] command`**: instead of a URL, a command that prints the same JSON
   (`<command> [--refresh] [pr/<owner>/<repo>/<n>]`), run every 3 minutes. mausi
   ships one for GitHub, no server needed: `bin/mausi-github --repo me/app
-  --project me/1` lists the open PRs in those repos and the moving items on
+  --project me/1` lists the open PRs in those repos and, in Boards, the moving items on
   the GitHub Projects (all statuses but the first and last, or `--status`), via `gh`.
   `bin/mausi-todos FILE...` shows TODO files the same way: each file's open
   items under their headings (Enter opens the file at the item). `command` can

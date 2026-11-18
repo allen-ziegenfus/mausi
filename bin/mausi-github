@@ -149,7 +149,7 @@ def fetch_work():
     if REPOS:
         out.update(mine=mine, involved=others, pr_error=f"not found: {', '.join(missing)}" if missing else None)
     if PROJECTS:
-        out["projects"] = projects
+        out["boards"] = projects
     return out, None
 
 

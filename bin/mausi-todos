@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mausi-todos: TODO files as a board for mausi. Prints the board's JSON with
 one project per file: its open items, grouped by heading, for the dashboard's
-Projects section (Enter opens the file at the item). Python 3.8+, standard
+Boards section (Enter opens the file at the item). Python 3.8+, standard
 library only.
 
     mausi-todos ~/src/app/TODO.md ~/notes/house.md
@@ -92,7 +92,7 @@ def read(path, skip):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="TODO files as mausi's board JSON (Projects).")
+    ap = argparse.ArgumentParser(description="TODO files as mausi's board JSON (Boards).")
     ap.add_argument("files", nargs="*", help="TODO files (Markdown lists)")
     ap.add_argument("--skip", default=r"idea|done|later|someday|archive",
                     help="regex: headings counted but not listed item by item")
@@ -103,7 +103,7 @@ def main():
         return 0
     a = ap.parse_args()
     projects = [read(os.path.expanduser(f), a.skip) for f in a.files]
-    print(json.dumps({"source": "todos", "projects": projects}, ensure_ascii=False))
+    print(json.dumps({"source": "todos", "boards": projects}, ensure_ascii=False))
     return 0
 
 
