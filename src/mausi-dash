@@ -1833,25 +1833,24 @@ def mail_lines(detail=False, width=None):
         return [(f"{head} {RED}{data['error']}{RESET}", None)]
     unread = data["unread"]
     everything = data.get("messages", unread)
-    lines = [(f"{head} {DIM}({len(unread)} unread"
-              + (f" of {len(everything)}" if detail else "") + " in Inbox, 14 days"
+    lines = [(f"{head} {DIM}({len(unread)} unread of {len(everything)} in Inbox, 14 days"
               + (" · z for all mail" if not detail else "") + f"){RESET}", None)]
     today = time.strftime("%Y-%m-%d")
-    # Zoomed: all of it, unread marked ●, read dimmed. Otherwise unread only.
-    for m in everything if detail else unread[:MAIL_MAX]:
+    # The newest first, read or not (unread marked ●, read dimmed): the top
+    # MAIL_MAX here, all of it zoomed, so both start the same.
+    for m in everything if detail else everything[:MAIL_MAX]:
         when = m["date"][11:16] if m["date"].startswith(today) else m["date"][5:10]
         star = f"{YELLOW}★{RESET}" if m["starred"] else " "
         # Mailing lists and mail not addressed to me are dimmed.
         color = DIM if m["list"] or not m["to_me"] or m.get("read") else ""
-        if detail:
-            star = (f"{CYAN}●{RESET}" if not m.get("read") else " ") + star
+        star = (f"{CYAN}●{RESET}" if not m.get("read") else " ") + star
         action = {"open": m["url"], "message_id": m.get("message_id"), "subject": m["subject"],
                   "task_seed": mail_task_seed(m),
                   "detail": (f"{m['from']} · {m['date'].replace('T', ' ')}",
                                                m["subject"] + ("\n\n" + m["body"] if m.get("body") else ""))}
         lines.append((f"  {DIM}{when:>5}{RESET} {star} {color}{fit(m['from'], 22)} {color}{m['subject']}{RESET}", action))
-    if not (everything if detail else unread):
-        lines.append((f"  {DIM}inbox zero{' (unread)' if not detail else ''}{RESET}", None))
+    if not everything:
+        lines.append((f"  {DIM}inbox zero{RESET}", None))
     return lines
 
 
