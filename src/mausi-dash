@@ -167,6 +167,8 @@ if not cfg.BOARD:  # the collector never fetches a board then: Tasks reads the o
 meetings = {"events": [], "synced": None, "error": None}
 meetings_tomorrow = {"events": []}
 mail = None  # the mail command's output: Inbox mail (all of it in zoom, unread otherwise)
+reminders = None  # the reminders command's output: {"items": [...]} (due ones here, all in zoom)
+REMINDERS_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "reminders")))
 PIN_HEAD = "\033[1;30;43m"  # bold black on yellow, for the pinned Now tasks
 MAIL_MAX = 6  # rows in the dashboard; zoom shows them all
 activity_data = None  # {"stamps": [epoch, ...]} — today's messages I typed to Claude
@@ -1846,6 +1848,106 @@ def mail_lines(detail=False, width=None):
     return lines
 
 
+def reminder_lines(detail=False, width=None):
+    """Reminders: the overdue and due-today ones; zoomed, every open one (due
+    first, then by list). d marks one done, R adds one."""
+    with lock:
+        data = reminders
+    head = f"{BOLD}Reminders{RESET}"
+    if data is None:
+        return [(head, None)] + LOADING
+    if data["error"]:
+        return [(f"{head} {RED}{data['error']}{RESET}", None)]
+    today, now = time.strftime("%Y-%m-%d"), time.strftime("%Y-%m-%dT%H:%M")
+    every = data.get("items") or []
+    due = [r for r in every if r.get("due") and r["due"][:10] <= today]
+    lines = [(f"{head} {DIM}({len(due)} due of {len(every)} open · "
+              + ("d marks done · R new" if detail else "z for all") + f"){RESET}", None)]
+    shown = sorted(every, key=lambda r: (not r.get("due"), r.get("due") or "", r.get("group", ""))) if detail else due
+    group = None
+    for r in shown:
+        if detail and not r.get("due") and r.get("group") != group:
+            group = r.get("group")
+            lines.append((f"  {CYAN}{group}{RESET}", None))
+        when, d = "", r.get("due") or ""
+        if d:
+            if d[:10] < today:
+                when = f"{RED}{d[5:10]:>5}{RESET}"
+            elif len(d) > 10 and d < now:  # timed, and the time has passed
+                when = f"{RED}{d[11:16]:>5}{RESET}"
+            elif d[:10] == today:
+                when = f"{YELLOW}{(d[11:16] or 'today'):>5}{RESET}"
+            else:
+                when = f"{DIM}{d[5:10]:>5}{RESET}"
+        else:
+            when = " " * 5
+        mark = {"high": f"{RED}!!{RESET}", "medium": f"{YELLOW}! {RESET}"}.get(r.get("priority"), "  ")
+        where = f"  {DIM}{r['group']}{RESET}" if r.get("group") and (r.get("due") or not detail) else ""
+        note = r.get("note") or ""
+        action = {"reminder": r["id"], "reminder_title": r["title"],
+                  "detail": (" · ".join(x for x in (r.get("group"), d.replace("T", " ")) if x),
+                             r["title"] + (f"\n\n{note}" if note else "") + (f"\n\n{r['url']}" if r.get("url") else "")),
+                  "task_seed": {"title": r["title"], "source": "reminders",
+                                "context": [f"From reminders ({r.get('group')}{', due ' + d if d else ''}): {r['title']}"
+                                            + (f" — {note[:400]}" if note else "")]}}
+        if r.get("url"):
+            action["open"] = r["url"]
+        lines.append((f"  {when} {mark}{r['title']}{where}", action))
+    if not shown:
+        lines.append((f"  {DIM}nothing due{RESET}", None))
+    return lines
+
+
+def add_reminder(text):
+    """A new reminder from "title [@list] [due today|tomorrow|YYYY-MM-DD]";
+    @list may be the start of an existing list's name."""
+    due, group = None, None
+    m = re.search(r"\s+due\s+(today|tomorrow|\d{4}-\d{2}-\d{2})\s*$", text, re.I)
+    if m:
+        word = m.group(1).lower()
+        due = {"today": time.strftime("%Y-%m-%d"),
+               "tomorrow": time.strftime("%Y-%m-%d", time.localtime(time.time() + 86400))}.get(word, word)
+        text = text[:m.start()]
+    m = re.search(r"(?:^|\s)@(\S+)", text)
+    if m:
+        with lock:
+            groups = sorted({r.get("group") for r in (reminders or {}).get("items", []) if r.get("group")})
+        want = m.group(1).lower()
+        hits = [g for g in groups if g.lower() == want] or [g for g in groups if g.lower().startswith(want)]
+        if len(hits) != 1:
+            return f"no single list matches @{m.group(1)}" + (f": {', '.join(hits[:5])}" if hits else "")
+        group = hits[0]
+        text = (text[:m.start()] + text[m.end():])
+    title = " ".join(text.split())
+    if not title:
+        return "no title: nothing added"
+    cmd = REMINDERS_CMD + ["--add", title] + (["--group", group] if group else []) + (["--due", due] if due else [])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        return "couldn't add it: the reminders command took over 10 s"
+    if r.returncode != 0:
+        return f"couldn't add it: {(r.stderr or r.stdout).strip()[:80]}"
+    if ctx:
+        ctx.refresh("reminders")
+    return f"added: {title[:50]}" + (f" in {group}" if group else "") + (f", due {due}" if due else "")
+
+
+def complete_reminder(rid, title):
+    try:
+        r = subprocess.run(REMINDERS_CMD + ["--complete", rid], capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        return "couldn't mark it done: the reminders command took over 10 s"
+    if r.returncode != 0:
+        return f"couldn't mark it done: {(r.stderr or r.stdout).strip()[:80]}"
+    with lock:
+        if reminders:
+            reminders["items"] = [x for x in reminders.get("items", []) if x.get("id") != rid]
+    if ctx:
+        ctx.refresh("reminders")
+    return f"done: {title[:60]}"
+
+
 TRIAGE_MARK = {"now": (RED, "●"), "today": (YELLOW, "●"), "soon": (DIM, "○")}
 
 
@@ -2336,6 +2438,8 @@ def _section_lines(name, rows, detail=False, width=None, history=False):
         return notes_lines(detail, width)
     if name == "mail":
         return mail_lines(detail, width)
+    if name == "reminders":
+        return reminder_lines(detail, width)
     if name == "slack":
         return slack_lines(detail, width)
     if name in ("docker", "kube"):
@@ -2363,18 +2467,19 @@ def _section_lines(name, rows, detail=False, width=None, history=False):
     return []
 
 
-VIEW_SECTIONS = {"Now": ("you", "today", "needs", "sessions", "pinned", "tasks", "docker", "kube"),
+VIEW_SECTIONS = {"Now": ("you", "today", "needs", "reminders", "sessions", "pinned", "tasks", "docker", "kube"),
                  "Work": ("slack", "notifications", "mail", "notes", "prs", "projects", "jira", "jira_created", "recent")}
 # Sections whose source isn't set up are left out: the board (PRs, Jira), the
 # calendar and mail commands, and the notification log (Linux capture).
 _SOURCE = {"today": bool(cfg.get("commands", "calendar")), "mail": bool(cfg.get("commands", "mail")),
+           "reminders": bool(REMINDERS_CMD),
            "prs": cfg.BOARD, "projects": cfg.BOARD, "jira": cfg.BOARD, "jira_created": cfg.BOARD, "recent": cfg.BOARD,
            "needs": bool(cfg.get("triage", "enabled")),
            "slack": os.path.exists(NOTIFICATIONS) or bool(cfg.get("notifications", "capture")),
            "notifications": os.path.exists(NOTIFICATIONS) or bool(cfg.get("notifications", "capture")),
            "docker": bool(shutil.which("docker")), "kube": bool(shutil.which("kubectl") or shutil.which("k3d"))}
 VIEW_SECTIONS = {view: tuple(n for n in names if _SOURCE.get(n, True)) for view, names in VIEW_SECTIONS.items()}
-SECTION_TITLES = {"you": "You", "today": "Today", "needs": "Needs you", "sessions": "Sessions", "docker": "Docker", "kube": "Kubernetes",
+SECTION_TITLES = {"you": "You", "today": "Today", "needs": "Needs you", "reminders": "Reminders", "sessions": "Sessions", "docker": "Docker", "kube": "Kubernetes",
                   "notifications": "Notifications", "slack": "Slack", "mail": "Mail", "notes": "Notes", "prs": "PRs", "projects": "Projects", "jira": "Jira: assigned to me", "jira_created": "Jira: created by me", "recent": "Recently closed", "tasks": "Tasks",
                   "pinned": "Now (pinned tasks)"}
 
@@ -2904,7 +3009,9 @@ On the selected row
   s               shell: in the task's folder, or in the container / pod
   e               edit: the task's TASK.md, a snippet or a quick note
   o               on a mail: open it (commands.mail_open) · elsewhere: the web board
-  d               dismiss a notification (also closes it on the desktop)
+  R               new reminder: title [@list] [due today|tomorrow|YYYY-MM-DD]
+  d               dismiss a notification (also closes it on the desktop) ·
+                  mark a reminder done (asks first)
   D               dismiss all notifications (asks first)
 
 Tasks
@@ -2940,7 +3047,7 @@ Stages: PLAN ▸ DEV ▸ REVIEW ▸ FWD (forwarded to the final reviewer) ▸ VE
 # Keys work with or without Shift (a missed Shift never does something else),
 # except these: D (dismiss all) is the bigger version of d, and l already moves
 # right, so L (log energy) needs the Shift.
-CASED_KEYS = ("D", "L")
+CASED_KEYS = ("D", "L", "R")
 KEY_RE = re.compile(r"\033\[<[0-9;]*[mM]|\033\[[0-9;]*[~A-Za-z]|\033O[A-Z]|\033|.", re.S)
 # An escape sequence that hasn't ended yet, at the end of what was read.
 PARTIAL_RE = re.compile(rb"\033(?:\[<?[0-9;]*|O)?$")
@@ -3098,7 +3205,7 @@ class Wake:
 
 def on_context(name, entry):
     """A source has new data: hand it to the section globals the views read."""
-    global work_data, infra_data, mail, meetings, meetings_tomorrow
+    global work_data, infra_data, mail, reminders, meetings, meetings_tomorrow
     data, error = entry.get("data"), entry.get("error")
     with lock:
         # An error shows as before, in place of the section; the collector
@@ -3109,6 +3216,8 @@ def on_context(name, entry):
             infra_data = data
         elif name == "mail":
             mail = {"unread": [], "error": error} if error or data is None else dict(data, error=None)
+        elif name == "reminders":
+            reminders = {"items": [], "error": error} if error or data is None else dict(data, error=None)
         elif name == "calendar":
             today = (data or {}).get("today") or {"events": [], "synced": None}
             meetings = dict(today, error=error if not today.get("events") and error else None)
@@ -3446,6 +3555,11 @@ def handle(ui, key, wakes):
         label = (f"New task from {seed['source']} (Enter adds, Ctrl-U clears):" if seed
                  else "New task (text, PR URL or Jira key):")
         ui.prompt = {"label": label, "text": seed.get("title", ""), "done": save_task}
+    elif key == "R" and not REMINDERS_CMD:
+        ui.say("no reminders: set [commands] reminders in config.toml", 3)
+    elif key == "R":
+        ui.prompt = {"label": "New reminder (title [@list] [due today|tomorrow|YYYY-MM-DD]):", "text": "",
+                     "done": add_reminder}
     elif key == "n":
         def save_note(text):
             add_quick_note(text)
@@ -3486,8 +3600,11 @@ def handle(ui, key, wakes):
             path, line, name = action["delete"]
             ui.confirm = (f"Delete {'snippet' if path == SNIPPETS_MD else 'note'}: {name[:70]}?",
                           lambda: delete_note(path, line, name))
+        elif action and action.get("reminder"):
+            rid, title = action["reminder"], action["reminder_title"]
+            ui.confirm = (f"Mark the reminder done: {title[:80]}?", lambda: complete_reminder(rid, title))
         else:
-            ui.say("d works on a notification, snippet or quick note", 2)
+            ui.say("d works on a notification, reminder, snippet or quick note", 2)
     elif key == "D":
         ui.confirm = ("Dismiss all notifications up to now (and close them on the desktop)?",
                       lambda: (dismiss(), close_desktop(recent_notification_ids()), "all dismissed")[-1])

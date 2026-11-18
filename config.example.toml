@@ -65,4 +65,5 @@ forward_name = ""                # who that is ("waiting on <name>", the stage l
 calendar = ""                    # prints today's meetings as JSON; an optional YYYY-MM-DD argument for another day
 mail = ""                        # prints unread mail as JSON
 mail_open = ""                   # opens one mail; {id} becomes its Message-ID
+reminders = ""                   # prints open reminders/to-dos as JSON ({"items": [...]}; see the README)
 worktree = ""                    # creates or opens a ticket's worktree: <command> <KEY> [repo]

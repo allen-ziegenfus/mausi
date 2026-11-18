@@ -106,6 +106,7 @@ DEFAULTS = {
         "calendar": "",                     # prints today's meetings as JSON (optional arg: YYYY-MM-DD)
         "mail": "",                         # prints unread mail as JSON
         "mail_open": "",                    # opens one mail; {id} is replaced with its Message-ID
+        "reminders": "",                    # prints open reminders/to-dos as JSON ({"items": [...]}); --complete ID marks one done
         "worktree": "",                     # makes/opens a ticket worktree: <cmd> <KEY>
     },
 }

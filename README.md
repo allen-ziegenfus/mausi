@@ -11,7 +11,7 @@ A [kitty](https://sw.kovidgoyal.net/kitty/) add-on for working with many
   and puts them back into kitty tabs after a restart or reboot.
 - **A dashboard in tab 1.** Sessions, with ⏳ on the ones waiting for you;
   pinned and open tasks; a break timer and your active time; Docker and
-  Kubernetes; notes and snippets. Optionally also PRs, Jira, calendar and mail.
+  Kubernetes; notes and snippets. Optionally also PRs, Jira, calendar, mail and reminders.
   Press `v` for the task view: each task with its sessions, tickets and PRs.
 - **Notifications that take you there.** When Claude needs you, a desktop
   notification names the tab, and clicking it focuses that tab.
@@ -160,6 +160,13 @@ Each of these is off until you configure it:
   (`{"unread": [...]}`; see `mail_lines` in `mausi-dash`). `mail_open` opens one.
   `bin/mausi-mail --host imap.example.com --user me@example.com` reads the
   Inbox over IMAP (read-only), with the password in the macOS Keychain.
+- **`[commands] reminders`**: a command that prints open reminders or to-dos
+  from any app as JSON, `{"items": [{"id", "title", "group", "due", "priority",
+  "note", "url"}]}` (`due` is `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM`, local, or
+  empty; `priority` is `high`, `medium`, `low` or empty), and marks one done
+  with `--complete ID`. Adds the Reminders section to Now (overdue and due
+  today; z shows all of them, d marks one done, R adds one with
+  `--add TITLE [--group G] [--due YYYY-MM-DD]`).
 - **`[commands] worktree`**: creates or opens a ticket's worktree (`w` key).
 - **`[notifications] capture = true`** (Linux): the dashboard runs
   `mausi-notif-capture`, which logs every desktop notification from D-Bus, for

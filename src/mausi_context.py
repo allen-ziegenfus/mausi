@@ -41,6 +41,7 @@ BOARD_URL = cfg.get("board", "url").rstrip("/")
 JIRA_SITE = cfg.get("jira", "site").rstrip("/")
 CALENDAR_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "calendar")))
 MAIL_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "mail")))
+REMINDERS_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "reminders")))
 NOTIFICATIONS = cfg.data_path("notifications", "log", "notifications.jsonl")
 DISMISSED = os.path.join(cfg.CACHE_DIR, "dismissed.json")
 NOTIFY_KEEP = 3 * 86400  # how far back the notifications source goes (Slack's zoomed window)
@@ -102,6 +103,22 @@ def fetch_mail(hard=False):
         return cfg.clean(json.loads(run(MAIL_CMD, 60) or "")), None
     except (TypeError, json.JSONDecodeError):
         return None, f"{MAIL_CMD[0]} failed"
+
+
+def fetch_reminders(hard=False):
+    """The reminders command's output: {"items": [...]}, items without an id or
+    title left out."""
+    try:
+        data = cfg.clean(json.loads(run(REMINDERS_CMD, 60) or ""))
+    except (TypeError, json.JSONDecodeError):
+        return None, f"{REMINDERS_CMD[0]} failed"
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return None, f"{REMINDERS_CMD[0]}: no items list"
+    keep = [i for i in items if isinstance(i, dict) and i.get("id") and i.get("title")]
+    fields = ("id", "title", "group", "due", "priority", "note", "url")
+    out = {"items": [{k: str(i.get(k) or "") for k in fields} for i in keep]}
+    return out, None
 
 
 def fetch_calendar(hard=False):
@@ -295,6 +312,7 @@ SOURCES = {
     "board": (fetch_board, 60 if BOARD_URL else 180, cfg.BOARD),  # a command (e.g. gh) is slower: every 3 min
     "mail": (fetch_mail, 120, bool(MAIL_CMD)),
     "calendar": (fetch_calendar, 120, bool(CALENDAR_CMD)),
+    "reminders": (fetch_reminders, 120, bool(REMINDERS_CMD)),
     "notifications": (fetch_notifications, 2, True),  # cheap: re-read only when the log changes
     "infra": (fetch_infra, 15, True),
     "sessions": (fetch_sessions, 15, True),
