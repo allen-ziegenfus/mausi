@@ -53,7 +53,7 @@ c on a task, Jira ticket, PR or notification opens a new kitty tab with a
 Claude session primed with that row's details (in the ticket's worktree if any).
 d hides one notification, D all up to now (kept in ~/.cache/mausi/
 dismissed.json; the capture log is untouched, and zoom still lists them dimmed).
-Tasks: x on a task moves it from Open to Done in ~/.claude/tasks.md (after a
+Tasks: d on a task moves it from Open to Done in ~/.claude/tasks.md (after a
 y/N confirm), u undoes the last one. p pins a task to the top of a "### Now"
 section (shown first here); p on a pinned task sends it back where it came from.
 +/- move a task up/down within its section.
@@ -1376,7 +1376,7 @@ def mark_task_done(ref):
 
 
 def reopen_task(tid):
-    """x on a done task (the task list's Done group)."""
+    """d on a done task (the task list's Done group)."""
     t = store().find(tid)
     if not t:
         return f"no such task: {tid}"
@@ -2864,21 +2864,21 @@ class Ui:
         elif self.tasks and not self.zoom:
             tabs = f"{BOLD}{CYAN}[Tasks]{RESET} {DIM}v system view{RESET}"
             keys = ("? keys · " + ("Tab/←→ column" if two else "Tab list/details")
-                    + " · / search · ↑↓/jk move · Enter open · Space details · c chat · w worktree · x done · p pin · e edit"
+                    + " · / search · ↑↓/jk move · Enter open · Space details · c chat · w worktree · d done · p pin · e edit"
                     " · t new task · a attach to a task · n note to task (empty Enter pastes) · y verified · s shell in the task folder · v system view · r refresh · q quit")
         elif self.zoom:
             tabs = f"{BOLD}{CYAN}[{SECTION_TITLES[self.zoom]}]{RESET} {DIM}full screen{RESET}"
             if self.query():
                 matches = sum(1 for _, action in self.lines[2] if action)
                 tabs += f"  {YELLOW}/{self.query()}{RESET} {DIM}({matches} match{'' if matches == 1 else 'es'}){RESET}"
-            keys = ("? keys · z/Esc/q back · / search · ↑↓/jk move · Enter open/copy · Space details · x task done · u undo · p pin · +/- move"
+            keys = ("? keys · z/Esc/q back · / search · ↑↓/jk move · Enter open/copy · Space details · d done · u undo · p pin · +/- move"
                     " · c chat · t new task · a attach · o open mail · n note · b snippet · e edit · s shell · w worktree · r refresh")
         else:
             tabs = "  ".join(f"{BOLD}{CYAN}[{name}]{RESET}" if i == self.view else f"{DIM}{name}{RESET}"
                              for i, name in enumerate(VIEWS)) + f"  {DIM}v tasks{RESET}"
             keys = "? keys · " + ("Tab/←→ column" if two else "Tab view") + (
-                " · ↑↓/jk move · Enter open/copy · z zoom · Space details · x task done · u undo · p pin · +/- move"
-                " · L log energy · d/D dismiss · c chat with Claude · t new task · a attach to a task · o open mail · n note · b snippet from clipboard · e edit · s shell · w worktree"
+                " · ↑↓/jk move · Enter open/copy · z zoom · Space details · d done · u undo · p pin · +/- move"
+                " · L log energy · D dismiss all · c chat with Claude · t new task · a attach to a task · o open mail · n note · b snippet from clipboard · e edit · s shell · w worktree"
                 " · 1-9/0 tab · g picker · m meet · o web board (on a mail: open it) · r refresh · q quit")
         if self.tasks and not self.zoom and self.query():
             matches = sum(1 for _, action in self.lines[3] if action)
@@ -3010,8 +3010,9 @@ On the selected row
   e               edit: the task's TASK.md, a snippet or a quick note
   o               on a mail: open it (commands.mail_open) · elsewhere: the web board
   R               new reminder: title [@list] [due today|tomorrow|YYYY-MM-DD]
-  d               dismiss a notification (also closes it on the desktop) ·
-                  mark a reminder done (asks first)
+  d               done: a task or reminder (asks first; on a done task: reopen
+                  it) · dismiss a notification (also closes it on the desktop) ·
+                  delete a snippet or quick note (asks first)
   D               dismiss all notifications (asks first)
 
 Tasks
@@ -3020,7 +3021,6 @@ Tasks
   a               attach the selected item (session, Slack, mail, PR…) to a task
   n               on a task (task view): add a note — type it, or Enter on
                   an empty prompt to paste the clipboard · elsewhere: quick note
-  x               mark done (asks first) · on a done task: reopen it
   u               undo the last task marked done
   p               pin to Now / unpin · + - move up/down within its section
   y               verified: record how it was tried in a real use case
@@ -3453,7 +3453,7 @@ def handle(ui, key, wakes):
         title, ref, today = action["task"], task_ref(action), time.strftime("%Y-%m-%d")
         ui.prompt = {"label": f"Verified “{title[:40]}” how? (Enter records it)", "text": "",
                      "done": lambda text: add_to_task(ref, [f"Verified {today}: {text}"])
-                     + " — x marks the task done"}
+                     + " — d marks the task done"}
     elif key == "n" and ui.tasks and ui.task_action().get("task"):
         # On a task in the task view: a note for that task, typed, or the
         # clipboard when Enter is pressed on an empty prompt; anywhere else n
@@ -3505,22 +3505,12 @@ def handle(ui, key, wakes):
             message = perform(action)
             if message:
                 ui.say(message, 3)
-    elif key == "x":
-        action = ui.action()
-        if action and action.get("done_task"):
-            tid = action["done_task"]
-            ui.confirm = (f"Reopen {tid}?", lambda: reopen_task(tid))
-        elif action and action.get("task"):
-            title, ref = action["task"], task_ref(action)
-            ui.confirm = (f"Mark done and move to Done: {title[:80]}?", lambda: mark_task_done(ref))
-        else:
-            ui.say("x works on a task row", 2)
     elif key == "u":
         ui.confirm = ("Undo the last task marked done?", undo_task_done)
     elif key in ("p", "+", "-"):
         action = ui.action()
         if action and action.get("done_task"):
-            ui.say("that task is done — x reopens it", 3)
+            ui.say("that task is done — d reopens it", 3)
         elif action and action.get("task"):
             ref = task_ref(action)
             ui.say(toggle_task_now(ref) if key == "p" else nudge_task(ref, -1 if key == "+" else 1))
@@ -3600,11 +3590,17 @@ def handle(ui, key, wakes):
             path, line, name = action["delete"]
             ui.confirm = (f"Delete {'snippet' if path == SNIPPETS_MD else 'note'}: {name[:70]}?",
                           lambda: delete_note(path, line, name))
+        elif action and action.get("done_task"):
+            tid = action["done_task"]
+            ui.confirm = (f"Reopen {tid}?", lambda: reopen_task(tid))
+        elif action and action.get("task"):
+            title, ref = action["task"], task_ref(action)
+            ui.confirm = (f"Mark done and move to Done: {title[:80]}?", lambda: mark_task_done(ref))
         elif action and action.get("reminder"):
             rid, title = action["reminder"], action["reminder_title"]
             ui.confirm = (f"Mark the reminder done: {title[:80]}?", lambda: complete_reminder(rid, title))
         else:
-            ui.say("d works on a notification, reminder, snippet or quick note", 2)
+            ui.say("d works on a task, reminder, notification, snippet or quick note", 2)
     elif key == "D":
         ui.confirm = ("Dismiss all notifications up to now (and close them on the desktop)?",
                       lambda: (dismiss(), close_desktop(recent_notification_ids()), "all dismissed")[-1])

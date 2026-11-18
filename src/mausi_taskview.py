@@ -495,7 +495,7 @@ def workflow(t, to_close, seen):
     # Closed and merged isn't the end: I still try it in a real use case.
     if t["stage"] == "DONE":
         if any(VERIFIED_RE.match(dash.plain(l)) for l in t["lines"]):
-            hints.append("verified — x marks the task done in tasks.md")
+            hints.append("verified — d marks the task done in tasks.md")
         else:
             t["stage"] = "VERIFY"
             reasons.append("everything is closed — try it in a real use case, then y to record how it went")
@@ -638,7 +638,7 @@ def list_lines(rows):
     done = done_tasks()
     if done:
         lines.append(("", None))
-        lines.append((f"{S.BOLD}Done{S.RESET} {S.DIM}(last {DONE_DAYS} days: {len(done)} · x reopens){S.RESET}", None))
+        lines.append((f"{S.BOLD}Done{S.RESET} {S.DIM}(last {DONE_DAYS} days: {len(done)} · d reopens){S.RESET}", None))
         for t in done:
             lines.append((f"  {S.GREEN}✓{S.RESET} {S.DIM}{t['done'][5:]}{S.RESET}         {S.DIM}{t['id']:<7}{t['title']}"
                           f"  {t.get('section', '')}{S.RESET}", done_action(t)))
@@ -729,7 +729,7 @@ def detail_lines(rows, task_id, width):
             return [(f"{S.DIM}select a task on the left{S.RESET}", None)]
         lines = [(f"{S.GREEN}✓{S.RESET} {S.BOLD}{task['title']}{S.RESET}", done_action(task))]
         facts = [task["id"], task.get("section", ""), f"added {task['added']}" if task.get("added") else "",
-                 f"done {task['done']}", "x reopens it"]
+                 f"done {task['done']}", "d reopens it"]
         lines += S.sub(" · ".join(f for f in facts if f), width, indent=2)
         lines += effort_lines(task, width)
         if task.get("summary"):

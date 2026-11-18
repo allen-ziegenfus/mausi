@@ -111,7 +111,7 @@ In the dashboard, `?` lists the keys. The main ones:
 | Space | show the full text |
 | v | task view |
 | c | new Claude session in a new tab, primed with the row (task, PR, ticket) |
-| t, x, p | new task, task done, pin to Now |
+| t, d, p | new task, done (task, reminder; dismiss a notification), pin to Now |
 | n, b | quick note, save the clipboard as a snippet |
 | L | log how the work feels (with `[energy] log` set) |
 | 1–9, g | go to a tab, tab picker |
