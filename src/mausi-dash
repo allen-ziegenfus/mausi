@@ -3026,6 +3026,22 @@ def restart_check(state):
                 state["bad"] = (path, now.get(path))
                 cfg.log_error("restart", f"not restarting: {os.path.basename(path)} doesn't compile: {e}")
             return False
+    # Compiling isn't enough: a module can still fail when it's imported (or
+    # a config value can be wrong). Start the new code once with --check,
+    # which loads everything and exits; only restart if that works.
+    if state.get("bad") == ("check", now):  # this version already failed: wait for the next change
+        return False
+    try:
+        r = subprocess.run([sys.executable, os.path.realpath(__file__), "--check"],
+                           capture_output=True, text=True, timeout=30)
+        ok, why = r.returncode == 0, (r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1]
+    except (OSError, subprocess.TimeoutExpired) as e:
+        ok, why = False, str(e)
+    if not ok:
+        if state.get("bad") != ("check", now):
+            state["bad"] = ("check", now)
+            cfg.log_error("restart", f"not restarting: the new code fails to start: {why}")
+        return False
     return True
 
 
@@ -3522,4 +3538,7 @@ def handle(ui, key, wakes):
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--check"]:  # the restart's trial run: everything loaded, nothing started
+        store()
+        sys.exit(0)
     main()
