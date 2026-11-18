@@ -1373,6 +1373,7 @@ def nudge_task(ref, step):
 def mark_task_done(ref):
     """Mark the task done (it stays in its folder; the overview lists it under
     Done), remembering it so u can undo."""
+    _last_done["kind"] = None  # u now means this task
     t = store().find(ref)
     if not t:
         return f"no such task: {ref[:60]}"
@@ -2117,6 +2118,7 @@ def mail_search_lines():
     return lines
 
 
+_last_done = {"kind": None}  # "triage" after d on a Needs-you item: u takes that back first
 TRIAGE_MARK = {"now": (RED, "●"), "today": (YELLOW, "●"), "soon": (DIM, "○")}
 
 
@@ -2130,9 +2132,16 @@ def needs_lines(detail=False, width=None):
     stamp = time.strftime("%H:%M", time.localtime(t.get("at", 0)))
     error = f" {RED}{t['error'][:60]}{RESET}" if t.get("error") else ""
     lines = [(f"{head} {DIM}(Claude at {stamp} · i asks again){RESET}{error}", None)]
+    # Marked done since this run: hidden. A later run was told about them, so
+    # an item it lists again has news.
+    done = {d["key"]: d["at"] for d in context.triage_done()}
+    items = [i for i in t.get("items") or [] if done.get(context.triage_key(i), 0) < t.get("at", 0)]
+    hidden = len(t.get("items") or []) - len(items)
+    if hidden:
+        lines[0] = (lines[0][0] + f" {DIM}· {hidden} done{RESET}", None)
     if t.get("summary"):
         lines += [(f"  {DIM}{l}{RESET}", None) for l in textwrap.wrap(t["summary"], max(30, (width or 100) - 4))[:None if detail else 2]]
-    for item in t.get("items") or []:
+    for item in items:
         color, mark = TRIAGE_MARK.get(item.get("urgency"), (DIM, "○"))
         ref = item.get("ref") or ""
         key = TICKET_ANY_RE.search(ref) or TICKET_ANY_RE.search(item.get("title", ""))
@@ -2144,11 +2153,12 @@ def needs_lines(detail=False, width=None):
                              item["title"] + "\n\n" + item.get("why", "") + (f"\n\n{item['url']}" if item.get("url") else ""))}
         if key:
             action["ticket"] = key.group(0)
+        action["triage_item"] = item
         lines.append((f"  {color}{mark}{RESET} {item['title']}  {DIM}{item.get('why', '')}{RESET}", action))
         if detail and ref:
             lines.append((f"      {DIM}{item.get('source')} · {ref}{RESET}", None))
-    if not t.get("items"):
-        lines.append((f"  {DIM}nothing needs you{RESET}", None))
+    if not items:
+        lines.append((f"  {DIM}nothing needs you{' (d marked the rest done)' if hidden else ''}{RESET}", None))
     return lines
 
 
@@ -3472,7 +3482,8 @@ On the selected row
   R               new reminder: title [@list] [due today|tomorrow|YYYY-MM-DD]
   d               done: a task or reminder (asks first; on a done task: reopen
                   it) · dismiss a notification (also closes it on the desktop) ·
-                  delete a snippet or quick note (asks first)
+                  delete a snippet or quick note (asks first) ·
+                  on a Needs-you item: done (the next triage leaves it out; u undoes)
   D               dismiss all notifications (asks first)
 
 Tasks
@@ -4021,6 +4032,10 @@ def handle(ui, key, wakes):
             message = perform(action)
             if message:
                 ui.say(message, 3)
+    elif key == "u" and _last_done["kind"] == "triage":
+        _last_done["kind"] = None
+        title = context.unmark_triage_done()
+        ui.say(f"back in Needs you: {title}" if title else "nothing to take back", 3)
     elif key == "u":
         ui.confirm = ("Undo the last task marked done?", undo_task_done)
     elif key in ("p", "+", "-"):
@@ -4098,7 +4113,11 @@ def handle(ui, key, wakes):
         perform(ui.action(), "worktree")
     elif key == "d":
         action = ui.action()
-        if action and action.get("notification"):
+        if action and action.get("triage_item"):
+            context.mark_triage_done(action["triage_item"])
+            _last_done["kind"] = "triage"
+            ui.say("done — the next triage knows (u takes it back)", 3)
+        elif action and action.get("notification"):
             dismiss(action["notification"])
             close_desktop(action.get("close"))
             ui.say("dismissed here and on the desktop (still in the log; z shows it)", 2)
@@ -4119,7 +4138,7 @@ def handle(ui, key, wakes):
             mid, subject = action["message_id"], action.get("subject", "")
             ui.confirm = (f"Delete the mail (move it to the trash): {subject[:70]}?", lambda: delete_mail(mid, subject))
         else:
-            ui.say("d works on a task, reminder, mail, notification, snippet or quick note", 2)
+            ui.say("d works on a Needs-you item, task, reminder, mail, notification, snippet or quick note", 2)
     elif key == "D":
         ui.confirm = ("Dismiss all notifications up to now (and close them on the desktop)?",
                       lambda: (dismiss(), close_desktop(recent_notification_ids()), "all dismissed")[-1])

@@ -396,6 +396,49 @@ TRIAGE = os.path.join(cfg.CACHE_DIR, "triage.json")
 TRIAGE_EVERY = 30 * 60  # at most this often on its own (and only when the input changed); i runs it now
 
 
+TRIAGE_DONE = os.path.join(cfg.CACHE_DIR, "triage-done.json")
+TRIAGE_DONE_KEEP = 3 * 86400
+
+
+def triage_key(item):
+    """What identifies a Needs-you item across runs (titles get reworded)."""
+    return f"{item.get('source', '')}|{(item.get('ref') or item.get('title', '')).strip().lower()}"
+
+
+def triage_done():
+    """[{key, title, ref, source, at}] marked done in the last 3 days, newest last."""
+    try:
+        with open(TRIAGE_DONE) as f:
+            done = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return [d for d in done if time.time() - d.get("at", 0) < TRIAGE_DONE_KEEP]
+
+
+def _save_triage_done(done):
+    if not os.path.exists(TRIAGE_DONE):
+        os.makedirs(cfg.CACHE_DIR, exist_ok=True)
+        os.close(os.open(TRIAGE_DONE, os.O_WRONLY | os.O_CREAT, 0o600))
+    cfg.write_atomic(TRIAGE_DONE, json.dumps(done))
+
+
+def mark_triage_done(item):
+    done = [d for d in triage_done() if d["key"] != triage_key(item)]
+    done.append({"key": triage_key(item), "title": item.get("title", ""), "ref": item.get("ref", ""),
+                 "source": item.get("source", ""), "at": time.time()})
+    _save_triage_done(done)
+
+
+def unmark_triage_done():
+    """Take back the last item marked done; returns its title or None."""
+    done = triage_done()
+    if not done:
+        return None
+    last = done.pop()
+    _save_triage_done(done)
+    return last["title"]
+
+
 def fetch_triage(hard=False):
     """What mausi-triage (Claude over this context) last said needs me:
     {at, summary, items: [{title, why, urgency, source, ref, url}], error}.
