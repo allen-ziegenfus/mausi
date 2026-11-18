@@ -2303,7 +2303,23 @@ def slack_lines(detail=False, width=None):
 LOADING = [(f"{DIM}loading…{RESET}", None)]
 
 
+_section_errors = set()  # (section, error) already logged
+
+
 def section_lines(name, rows, detail=False, width=None, history=False):
+    """A section's lines; one that fails to draw shows its error in its place
+    (logged once) instead of taking the dashboard down."""
+    try:
+        return _section_lines(name, rows, detail, width, history)
+    except Exception as e:  # noqa: BLE001
+        what = f"{type(e).__name__}: {e}"
+        if (name, what) not in _section_errors:
+            _section_errors.add((name, what))
+            cfg.log_error(f"section {name}")
+        return [(f"{BOLD}{SECTION_TITLES.get(name, name)}{RESET} {RED}couldn't draw: {what[:80]}{RESET}", None)]
+
+
+def _section_lines(name, rows, detail=False, width=None, history=False):
     with lock:
         infra, work = infra_data, work_data
     if name == "you":
