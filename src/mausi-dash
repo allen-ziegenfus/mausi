@@ -2943,6 +2943,83 @@ def read_keys(fd):
             for k in KEY_RE.findall(data)]
 
 
+# --- restart on change -------------------------------------------------------
+# The dashboard runs for days; when its code (src/, bin/) or config.toml
+# changes, it starts itself again (exec, same tab), in the same view. It waits
+# until the files have been quiet for RESTART_SETTLE seconds (a git pull writes
+# many) and the Python in them compiles, so a half-saved file doesn't kill it.
+RESTART_SETTLE = 2
+_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+def code_stamp():
+    stamp = {}
+    for d in ("src", "bin"):
+        try:
+            names = os.listdir(os.path.join(_ROOT, d))
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(_ROOT, d, name)
+            if name.endswith((".pyc", "~", ".swp")) or not os.path.isfile(path):
+                continue
+            stamp[path] = os.stat(path).st_mtime_ns
+    try:
+        stamp[cfg.CONFIG_PATH] = os.stat(cfg.CONFIG_PATH).st_mtime_ns
+    except OSError:
+        pass
+    return stamp
+
+
+def _is_python(path):
+    if path.endswith(".py"):
+        return True
+    try:
+        with open(path, "rb") as f:
+            return b"python" in f.readline()
+    except OSError:
+        return False
+
+
+def restart_check(state):
+    """Called each poll; state is {"stamp", "pending", "since", "bad"}. Returns
+    True when it's time to restart."""
+    now = code_stamp()
+    if now == state["stamp"]:
+        state["pending"] = None
+        return False
+    if now != state.get("pending"):  # still changing: wait for it to settle
+        state["pending"], state["since"] = now, time.time()
+        return False
+    if time.time() - state["since"] < RESTART_SETTLE:
+        return False
+    changed = [p for p in now if now.get(p) != state["stamp"].get(p)]
+    for path in changed:
+        if path == cfg.CONFIG_PATH or not _is_python(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                compile(f.read(), path, "exec")
+        except (SyntaxError, ValueError, OSError) as e:
+            if state.get("bad") != (path, now.get(path)):
+                state["bad"] = (path, now.get(path))
+                cfg.log_error("restart", f"not restarting: {os.path.basename(path)} doesn't compile: {e}")
+            return False
+    return True
+
+
+def restart(ui):
+    """exec this script again, in the view that's open."""
+    view = "tasks" if ui.tasks else VIEWS[ui.view].lower()
+    args, skip = [], False
+    for a in sys.argv[1:]:  # everything but an earlier --view <name>
+        if skip or a == "--view":
+            skip = not skip
+            continue
+        args.append(a)
+    os.execv(sys.executable, [sys.executable, os.path.realpath(__file__), *args, "--view", view])
+
+
 def start_view():
     """--view work/tasks: the view to start in."""
     if "--view" in sys.argv[1:-1]:
@@ -3022,11 +3099,16 @@ def main():
     ui = Ui(view)
     rows = []
     last_poll = 0
+    code = {"stamp": code_stamp(), "pending": None}
+    restarting = False
     try:
         while True:
             # Keypresses redraw immediately; the session list is re-polled
             # (kitty @ ls + git per tab) only every SESSION_REFRESH seconds.
             if time.time() - last_poll >= SESSION_REFRESH:
+                if restart_check(code):
+                    restarting = True
+                    break
                 rows = sessions()
                 last_poll = time.time()
                 threading.Thread(
@@ -3061,6 +3143,9 @@ def main():
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         sys.stdout.write("\033[?1006l\033[?1000l\033[?25h\033[H\033[2J")
+        sys.stdout.flush()
+    if restarting:
+        restart(ui)
 
 
 def process_key(ui, key, wakes):

@@ -181,6 +181,9 @@ Each of these is off until you configure it:
 Design notes, the files mausi keeps, and gotchas are in
 [`docs/NOTES.md`](docs/NOTES.md).
 
+The dashboard starts itself again when its code (`src/`, `bin/`) or `config.toml`
+changes, in the same view, once the files have settled and compile.
+
 Open sessions come from Claude Code's own records in `~/.claude/sessions/`.
 Sessions running outside kitty (Terminal, VS Code) are listed too, marked
 "in Terminal" and without a tab number. Enter on one moves it into kitty: after
