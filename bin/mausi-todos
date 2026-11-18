@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""mausi-todos: TODO files as a board for mausi. Prints the board's JSON with
+one project per file: its open items, grouped by heading, for the dashboard's
+Projects section (Enter opens the file at the item). Python 3.8+, standard
+library only.
+
+    mausi-todos ~/src/app/TODO.md ~/notes/house.md
+    mausi-todos --skip 'ideas|later' FILE...    # headings not listed item by item
+                                                # (default: ideas, done, later, someday, archive)
+
+An item is a top-level list entry (`- `, `* `, `1. `). `- [x]` and
+~~struck~~ entries count as done; indented entries belong to the one above.
+Its title is the bold part (`- **Fix the thing.** Details…`) or the first
+sentence. In mausi's config.toml, next to other board commands:
+
+    [board]
+    command = ["mausi-github --repo me/app", "mausi-todos ~/src/app/TODO.md"]
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import sys
+
+ITEM_RE = re.compile(r"^(?:[-*+]|\d+[.)])\s+(.*)")
+HEAD_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
+
+
+def title_of(text):
+    text = text.strip()
+    m = re.match(r"\*\*(.+?)\*\*", text) or re.match(r"__(.+?)__", text)
+    if m:
+        return m.group(1).strip()
+    first = re.split(r"(?<=[.!?])\s", text, maxsplit=1)[0]
+    return first if len(first) <= 120 else first[:119] + "…"
+
+
+def read(path, skip):
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        return {"title": f"{os.path.basename(path)}: {e.strerror}", "url": "", "statuses": [], "shown": [],
+                "counts": {}, "items": [], "total": 0}
+    name = os.path.basename(os.path.dirname(os.path.abspath(path))) or path
+    heading, headings, items, counts, done = "", [], [], {}, 0
+    in_code = False
+    for n, line in enumerate(lines, 1):
+        if line.lstrip().startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        h = HEAD_RE.match(line)
+        if h:
+            if len(h.group(1)) >= 2 or not headings:  # the file's own "# TODO" is no section
+                heading = h.group(2) if len(h.group(1)) >= 2 else ""
+                if heading and heading not in headings:
+                    headings.append(heading)
+            continue
+        m = ITEM_RE.match(line)  # top level only: no indent
+        if not m:
+            continue
+        text = m.group(1)
+        for more in lines[n:n + 6]:  # its wrapped lines: a bold title can span two
+            if not more.strip() or not more[:1].isspace() or ITEM_RE.match(more.strip()):
+                break
+            text += " " + more.strip()
+        box = re.match(r"\[([ xX])\]\s*(.*)", text)
+        if box:
+            text = box.group(2)
+            if box.group(1) != " ":
+                done += 1
+                continue
+        if re.fullmatch(r"~~.*~~\W*", text.strip()):
+            done += 1
+            continue
+        section = heading or "—"
+        if section == "—" and section not in headings:
+            headings.insert(0, section)
+        counts[section] = counts.get(section, 0) + 1
+        items.append({"status": section, "priority": "", "title": title_of(text), "ref": f"L{n}",
+                      "url": "", "file": os.path.abspath(path), "line": n, "assignees": [], "updated": ""})
+    shown = [h for h in headings if not re.search(skip, h, re.I)]
+    if done:
+        counts["done"] = done
+    mtime = datetime.date.fromtimestamp(os.path.getmtime(path)).isoformat()
+    return {"title": f"{name} TODO", "url": "", "file": os.path.abspath(path), "statuses": headings + ["done"],
+            "shown": shown, "counts": counts, "updated": mtime,
+            "items": [i for i in items if i["status"] in shown], "total": len(items) + done}
+
+
+def main():
+    ap = argparse.ArgumentParser(description="TODO files as mausi's board JSON (Projects).")
+    ap.add_argument("files", nargs="*", help="TODO files (Markdown lists)")
+    ap.add_argument("--skip", default=r"idea|done|later|someday|archive",
+                    help="regex: headings counted but not listed item by item")
+    ap.add_argument("--refresh", action="store_true", help="accepted for mausi; files are always read fresh")
+    popup = [x for x in sys.argv[1:] if re.match(r"(pr|issue)/", x)]
+    if popup:  # mausi asks every board command for a pop-up; that's other commands' business
+        print(json.dumps({"error": "mausi-todos has no " + popup[0].split("/")[0]}))
+        return 0
+    a = ap.parse_args()
+    projects = [read(os.path.expanduser(f), a.skip) for f in a.files]
+    print(json.dumps({"source": "todos", "projects": projects}, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

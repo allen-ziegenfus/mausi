@@ -1513,20 +1513,26 @@ def project_lines(data, detail=False):
         if lines:
             lines.append(("", None))
         lines.append((f"{BOLD}{p['title']}{RESET} {DIM}({len(p['items'])}" + (f" · {rest}" if rest else "") + f"){RESET}",
-                      {"open": p["url"]}))
+                      {"open": p["url"]} if p.get("url") else {"edit": (p["file"], 1)} if p.get("file") else None))
         status = None
+        has_prio = any(i.get("priority") for i in p["items"])  # TODO files have none: no column
         for i in p["items"]:
             if i["status"] != status:
                 status = i["status"]
                 lines.append((f"  {CYAN}{status}{RESET}", None))
             prio = {"hoch": RED, "high": RED, "mittel": YELLOW, "medium": YELLOW}.get(i["priority"].lower(), DIM)
-            action = {"open": i["url"], "detail": (i["ref"] or i["status"], f"{i['title']}\n\n{i['status']}"
+            where = i["url"] or (f"{i['file']}:{i['line']}" if i.get("file") else "")
+            action = {"open": i["url"]} if i["url"] else {"edit": (i["file"], i.get("line") or 1)} if i.get("file") else {}
+            action["detail"] = (i["ref"] or i["status"], f"{i['title']}\n\n{i['status']}"
                                                    + (f" · priority {i['priority']}" if i["priority"] else "")
                                                    + (f" · {', '.join(i['assignees'])}" if i["assignees"] else "")
-                                                   + f" · updated {i['updated']}\n{i['url']}")}
-            lines.append((f"    {prio}{(i['priority'] or '·')[:6]:<6}{RESET} {i['title']}  {DIM}{i['ref'].split('/')[-1]}{RESET}", action))
+                                                   + (f" · updated {i['updated']}" if i.get("updated") else "") + f"\n{where}")
+            col = f"{prio}{(i['priority'] or '·')[:6]:<6}{RESET} " if has_prio else ""
+            lines.append((f"    {col}{i['title']}  {DIM}{i['ref'].split('/')[-1]}{RESET}", action))
             if detail:
                 lines += sub(f"{i['ref']} · updated {i['updated']}" + (f" · {', '.join(i['assignees'])}" if i["assignees"] else ""))
+    for e in data.get("board_errors") or []:  # a board command that failed while the others worked
+        lines.append((f"  {RED}{e[:120]}{RESET}", None))
     return lines or [(f"{BOLD}Projects{RESET} {DIM}none{RESET}", None)]
 
 
@@ -3334,6 +3340,8 @@ def handle(ui, key, wakes):
             ui.toggle_zoom()
         elif action and action.get("outside"):
             start_move_into_kitty(ui, action, wakes)
+        elif action and action.get("edit") and not action.get("open") and not action.get("task"):
+            edit_file(*action["edit"])  # e.g. a TODO file's item (mausi-todos)
         elif action and "copy" in action:
             ok = copy_to_clipboard(action["copy"])
             ui.say(f"copied: {action['copy_name']}" if ok else "copying to the clipboard failed")

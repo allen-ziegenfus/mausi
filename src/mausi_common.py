@@ -350,28 +350,82 @@ def process_args(pid):
         return []
 
 
+def board_commands():
+    """[board] command as argv lists: one command (a string) or several (a list)."""
+    value = get("board", "command") or []
+    return [shlex.split(os.path.expanduser(c)) for c in ([value] if isinstance(value, str) else value) if c.strip()]
+
+
+def _run_board(cmd, args, timeout):
+    try:
+        r = subprocess.run(cmd + args, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise OSError(f"{os.path.basename(cmd[0])} timed out")
+    except OSError as e:
+        raise OSError(f"{os.path.basename(cmd[0])}: {e.strerror}")
+    if not r.stdout.strip():
+        raise OSError((r.stderr.strip() or f"{os.path.basename(cmd[0])} exited {r.returncode}").splitlines()[-1][:200])
+    return json.loads(r.stdout)
+
+
+def merge_boards(parts):
+    """Several boards' dash.json as one: lists joined, dicts merged, the first
+    value kept for anything else."""
+    out = {}
+    for part in parts:
+        for k, v in part.items():
+            if k not in out:
+                out[k] = v
+            elif isinstance(out[k], list) and isinstance(v, list):
+                out[k] = out[k] + v
+            elif isinstance(out[k], dict) and isinstance(v, dict):
+                out[k] = merge_boards([out[k], v])
+    return out
+
+
 def board_get(path="dash.json", hard=False, timeout=60):
     """The board's JSON for path ("dash.json", "pr/<owner>/<repo>/<n>",
-    "issue/<KEY>"): from [board] url, or else from [board] command, run as
-    `<command> [--refresh] [<path>]` (no path for dash.json). Raises OSError or
-    ValueError when there's no board or it fails."""
+    "issue/<KEY>"): from [board] url, or else from [board] command(s), each run
+    as `<command> [--refresh] [<path>]` (no path for dash.json). Several
+    commands' dash.json are merged (merge_boards); one that fails adds its
+    error to "board_errors". A pop-up comes from the first command that has it.
+    Raises OSError or ValueError when there's no board or it fails."""
     url = get("board", "url").rstrip("/")
     if url:
         import urllib.request
         q = "?refresh=1" if hard and path == "dash.json" else ""
         with urllib.request.urlopen(f"{url}/api/{path}{q}", timeout=timeout) as r:
             return json.load(r)
-    cmd = shlex.split(os.path.expanduser(get("board", "command")))
-    if not cmd:
+    cmds = board_commands()
+    if not cmds:
         raise OSError("no board configured")
     args = (["--refresh"] if hard else []) + ([] if path == "dash.json" else [path])
-    try:
-        r = subprocess.run(cmd + args, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise OSError(f"{os.path.basename(cmd[0])} timed out")
-    if not r.stdout.strip():
-        raise OSError((r.stderr.strip() or f"{os.path.basename(cmd[0])} exited {r.returncode}").splitlines()[-1][:200])
-    return json.loads(r.stdout)
+    if path != "dash.json":
+        last = None
+        for cmd in cmds:
+            try:
+                data = _run_board(cmd, args, timeout)
+            except (OSError, ValueError) as e:
+                last = {"error": str(e)}
+                continue
+            if not (isinstance(data, dict) and data.get("error")):
+                return data
+            last = data
+        return last
+    parts, errors = [], []
+    for cmd in cmds:  # one after another: there are only a few, and gh is the slow one
+        try:
+            data = _run_board(cmd, args, timeout)
+            if isinstance(data, dict):
+                parts.append(data)
+        except (OSError, ValueError) as e:
+            errors.append(f"{os.path.basename(cmd[0])}: {e}")
+    if not parts:
+        raise OSError("; ".join(errors) or "no board output")
+    out = merge_boards(parts)
+    if errors:
+        out["board_errors"] = errors
+    return out
 
 
 BOARD = bool(get("board", "url") or get("board", "command"))  # PR/Jira sections on

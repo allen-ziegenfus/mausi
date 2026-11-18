@@ -150,6 +150,9 @@ Each of these is off until you configure it:
   ships one for GitHub, no server needed: `bin/mausi-github --repo me/app
   --project me/1` lists the open PRs in those repos and the moving items on
   the GitHub Projects (all statuses but the first and last, or `--status`), via `gh`.
+  `bin/mausi-todos FILE...` shows TODO files the same way: each file's open
+  items under their headings (Enter opens the file at the item). `command` can
+  be a list; the commands' output is merged.
 - **`[commands] calendar`**: a command that prints today's meetings as JSON:
   `{"events": [{"title", "start": "YYYY-MM-DDTHH:MM", "end", "allday", "location", "meet"}], "synced": "…"}`.
   It gets an optional `YYYY-MM-DD` argument for another day. Adds the Today section and meeting reminders.
