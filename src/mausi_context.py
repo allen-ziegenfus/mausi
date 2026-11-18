@@ -118,6 +118,8 @@ def fetch_reminders(hard=False):
     keep = [i for i in items if isinstance(i, dict) and i.get("id") and i.get("title")]
     fields = ("id", "title", "group", "due", "priority", "note", "url")
     out = {"items": [{k: str(i.get(k) or "") for k in fields} for i in keep]}
+    if isinstance(data.get("digest"), list):  # what the command gives triage
+        out.update(digest=[str(x) for x in data["digest"]], digest_title=str(data.get("digest_title") or ""))
     return out, None
 
 

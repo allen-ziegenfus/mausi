@@ -166,7 +166,9 @@ Each of these is off until you configure it:
   empty; `priority` is `high`, `medium`, `low` or empty), and marks one done
   with `--complete ID`. Adds the Reminders section to Now (overdue and due
   today; z shows all of them, d marks one done, R adds one with
-  `--add TITLE [--group G] [--due YYYY-MM-DD]`).
+  `--add TITLE [--group G] [--due YYYY-MM-DD]`). Triage sees none of it unless
+  the command also prints `"digest": ["line", ...]` (and a `"digest_title"`):
+  those lines go to Claude as they are, so the command picks what it reads.
 - **`[commands] worktree`**: creates or opens a ticket's worktree (`w` key).
 - **`[notifications] capture = true`** (Linux): the dashboard runs
   `mausi-notif-capture`, which logs every desktop notification from D-Bus, for

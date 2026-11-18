@@ -3,10 +3,11 @@
 
 Reads the context file (mausi_context; nothing is fetched here), boils it down
 to a digest of what came in recently (mail, Slack, other notifications, PRs,
-Jira, the calendar, the pinned Now tasks), and runs one `claude -p` over it:
-no tools, no MCP servers, no plugins or hooks, no saved session. The answer
-goes to ~/.cache/mausi/triage.json (0600), which the collector puts in the
-context and the dashboard shows as "Needs you".
+Jira, the calendar, the pinned Now tasks, any source's own "digest" lines),
+and runs one `claude -p` over it: no tools, no MCP servers, no plugins or
+hooks, no saved session. The answer goes to ~/.cache/mausi/triage.json
+(0600), which the collector puts in the context and the dashboard shows as
+"Needs you".
 
     mausi-triage            # only when the digest changed since the last run
     mausi-triage --force    # run anyway
@@ -51,7 +52,7 @@ SCHEMA = {
                     "title": {"type": "string", "description": "What to do, imperative, under 80 characters."},
                     "why": {"type": "string", "description": "One short sentence: who is waiting or what is at stake."},
                     "urgency": {"type": "string", "enum": ["now", "today", "soon"]},
-                    "source": {"type": "string", "enum": ["mail", "slack", "notification", "pr", "jira", "calendar", "task"]},
+                    "source": {"type": "string", "enum": ["mail", "slack", "notification", "pr", "jira", "calendar", "task", "other"]},
                     "ref": {"type": "string", "description": "The Jira key, PR ref (owner/repo#n), Slack conversation or mail subject it is about."},
                     "url": {"type": "string", "description": "A URL from the digest to open it, or empty."},
                 },
@@ -64,11 +65,13 @@ SCHEMA = {
 
 PROMPT = """You triage incoming work for a software engineer. Below is a digest of what
 arrived recently and what is open: mail, Slack, desktop notifications, pull
-requests, Jira tickets, today's calendar and the tasks they pinned as "Now".
+requests, Jira tickets, today's calendar, what their other tools report (such
+as reminders) and the tasks they pinned as "Now".
 
 Pick at most 8 things that need them: someone waiting on a reply or a review,
 a PR with new comments or failing CI, a direct question, a mention, a meeting
-to prepare for, a pinned task with a deadline. Leave out newsletters, bots,
+to prepare for, a pinned task with a deadline, an overdue or due-today to-do
+that matters (not a shopping or reading list). Leave out newsletters, bots,
 automated digests, announcements, FYIs, things already handled (the last
 comment is theirs and nobody replied) and anything merely interesting.
 Order by urgency: "now" (someone waits right now, or within the hour),
@@ -167,6 +170,14 @@ def digest(doc):
         out.append("## Other notifications, last 8h")
         out += [f"- {when(n['ts'])} {n['label']}: {clip(n['summary'], 120)} — {clip(n['body'], 200)}"
                 + (f" · {n['url']}" if n.get("url") else "") for n in other[:25]]
+    # Any source can hand triage its own part: {"digest": [lines], "digest_title": "..."}.
+    # The command decides what Claude sees; nothing here knows what it is.
+    for name, entry in sorted(src.items()):
+        d = (entry or {}).get("data")
+        lines = d.get("digest") if isinstance(d, dict) else None
+        if isinstance(lines, list) and lines:
+            out.append(f"## {clip(d.get('digest_title') or name.capitalize(), 120)}")
+            out += [f"- {clip(line, 400)}" for line in lines[:40]]
     return "\n".join(out)
 
 
