@@ -22,6 +22,11 @@
     mausi context --watch    # run the collector on its own (the dashboard
                              # otherwise runs it)
     mausi context --refresh [SOURCE]  # ask the collector to fetch now
+    mausi mail inbox         # the Inbox, last 14 days ([commands] mail), as text
+    mausi mail search WORDS  # every folder, on the server: mails with all the words
+    mausi mail show ID [FOLDER]  # one mail (by Message-ID) as text: headers, then the
+                             # body (FOLDER, as search shows it: found at once)
+                             # (add --json to inbox/search for the raw JSON)
     mausi setup              # offer the kitty, Claude Code and PATH setup that is
                              # missing (plain `mausi` offers it too, once)
 
@@ -190,6 +195,71 @@ def cmd_restore(args):
     return start_dash() if dash else 0
 
 
+def cmd_mail(args):
+    """Read-only mail for people and Claude: the configured mail command's
+    list, server search and one mail as text. (Deleting is the dashboard's d.)"""
+    import email
+    import email.policy
+    import importlib.machinery
+    import importlib.util
+    import mausi_common as cfg
+    cmd = shlex.split(os.path.expanduser(cfg.get("commands", "mail")))
+    if not cmd:
+        print("no mail command: set [commands] mail in ~/.config/mausi/config.toml", file=sys.stderr)
+        return 1
+    as_json = "--json" in args
+    args = [a for a in args if a != "--json"]
+    what, rest = (args[0], args[1:]) if args else ("inbox", [])
+    if what == "show" and rest:
+        folder = ["--folder", rest[1]] if len(rest) > 1 else []
+        r = subprocess.run(cmd + [f"--raw={rest[0]}"] + folder, capture_output=True)
+        if r.returncode != 0:
+            sys.stderr.write(r.stderr.decode(errors="replace"))
+            return r.returncode
+        loader = importlib.machinery.SourceFileLoader("mausi_mail_view", os.path.join(HERE, "mausi-mail-view"))
+        spec = importlib.util.spec_from_loader("mausi_mail_view", loader)
+        view = importlib.util.module_from_spec(spec)
+        loader.exec_module(view)
+        msg = email.message_from_bytes(r.stdout, policy=email.policy.default)
+        source, text, _ = view.body_parts(msg)
+        body = view.plain_enough(source, text) if source else text
+        if body is None:
+            body = text if text and len(text.split()) >= len(view.html_text(source).split()) / 2 else view.html_text(source)
+        # (view.header and cfg.clean drop control characters: mail text is
+        # someone else's, and must not reach the terminal as escape sequences)
+        for h in ("From", "To", "Cc", "Date", "Subject", "Message-ID"):
+            if msg.get(h):
+                print(f"{h}: {view.header(msg, h)}")
+        attachments = [cfg.clean(str(p.get_filename())) for p in msg.walk() if p.get_filename()]
+        if attachments:
+            print("Attachments: " + ", ".join(attachments))
+        print()
+        print(cfg.clean(body) or "(no text)")
+        return 0
+    if what == "search" and rest:
+        r = subprocess.run(cmd + ["--search", " ".join(rest)], capture_output=True, text=True)
+    elif what == "inbox":
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    else:
+        print("usage: mausi mail inbox | search WORDS | show MESSAGE-ID [FOLDER]  [--json]", file=sys.stderr)
+        return 2
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        return r.returncode
+    found = cfg.clean(json.loads(r.stdout))
+    if as_json:
+        print(json.dumps(found, ensure_ascii=True))
+        return 0
+    found = found.get("messages", [])
+    for m in found:
+        mark = "unread" if not m.get("read") else "read"
+        print(f"{m['date'].replace('T', ' ')}  [{m.get('folder', 'INBOX')}, {mark}]  {m['from']} <{m.get('from_addr', '')}>")
+        print(f"    {m['subject']}")
+        print(f"    id: {m['message_id'] or '(none: this mail has an id that is not safe to use)'}")
+    print(f"({len(found)} mails)")
+    return 0
+
+
 def main():
     args = sys.argv[1:]
     if args[:1] in (["-h"], ["--help"], ["help"]):
@@ -204,6 +274,8 @@ def main():
         return mausi_context.main(args[1:])
     if args[:1] == ["snapshot"]:
         return cmd_snapshot(args[1:])
+    if args[:1] == ["mail"]:
+        return cmd_mail(args[1:])
     if args[:1] == ["setup"]:
         import mausi_setup
         mausi_setup.run(ask_again=True)

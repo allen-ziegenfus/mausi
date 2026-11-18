@@ -92,6 +92,7 @@ mausi dash               # just the dashboard
 mausi-tui                # the same dashboard on Textual (try-out)
 mausi snapshot --history # earlier snapshots; mausi --from <file> restores one
 mausi setup              # offer the kitty / Claude Code / PATH / status line setup that's missing
+mausi mail search WORDS  # your mail, for you and Claude (inbox, search, show ID): the mail skill
 
 tasks new "Try mausi on the Mac" -n "first note"
 tasks                    # open tasks
