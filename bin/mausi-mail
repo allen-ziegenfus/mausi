@@ -2,15 +2,12 @@
 """mausi-mail: the Inbox over IMAP, for mausi's [commands] mail. Read-only:
 nothing is marked read. Python 3.9+, standard library only.
 
-    mausi-mail --host imap.example.com --user me@example.com [--me alias@example.com] [--web URL]
+    mausi-mail --host imap.example.com --user me@example.com --password-cmd "CMD"
+               [--me alias@example.com] [--web URL]
 
-The password comes from the macOS Keychain (service --keychain, default
-"mausi-mail"; account = --user); add it once with
-
-    security add-generic-password -s mausi-mail -a me@example.com -w
-
-(it asks for the password; use an app password if the account has 2FA), or
-from $MAUSI_MAIL_PASSWORD. Prints {"unread": [...], "messages": [...]}: the
+The password is what --password-cmd prints (a keychain or password manager's
+command line; use an app password if the account has 2FA), or
+$MAUSI_MAIL_PASSWORD. Prints {"unread": [...], "messages": [...]}: the
 last --days days of the Inbox (default 14), newest first, in the fields
 mausi's Mail section reads.
 """
@@ -23,6 +20,7 @@ import imaplib
 import json
 import os
 import re
+import shlex
 import ssl
 import subprocess
 import sys
@@ -30,13 +28,14 @@ import sys
 MAX = 60  # messages fetched at most
 
 
-def password(user, service):
+def password(command):
     if os.environ.get("MAUSI_MAIL_PASSWORD"):
         return os.environ["MAUSI_MAIL_PASSWORD"]
-    r = subprocess.run(["security", "find-generic-password", "-s", service, "-a", user, "-w"],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        raise SystemExit(f"no password: add it with  security add-generic-password -s {service} -a {user} -w")
+    if not command:
+        raise SystemExit("no password: give --password-cmd (or set MAUSI_MAIL_PASSWORD)")
+    r = subprocess.run(shlex.split(os.path.expanduser(command)), capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        raise SystemExit(f"no password from --password-cmd: {r.stderr.strip()[:200]}")
     return r.stdout.rstrip("\n")
 
 
@@ -73,7 +72,7 @@ def main():
     ap.add_argument("--host", required=True)
     ap.add_argument("--port", type=int, default=993)
     ap.add_argument("--user", required=True)
-    ap.add_argument("--keychain", default="mausi-mail", help="Keychain service the password is under (default mausi-mail)")
+    ap.add_argument("--password-cmd", default="", help="a command that prints the password")
     ap.add_argument("--me", action="append", default=[], help="another address of mine, for 'to me' (repeatable)")
     ap.add_argument("--days", type=int, default=14)
     ap.add_argument("--web", default="", help="URL the mail opens at (the webmail), e.g. https://mail.example.com")
@@ -82,7 +81,7 @@ def main():
 
     try:
         imap = imaplib.IMAP4_SSL(a.host, a.port, ssl_context=ssl.create_default_context(), timeout=30)
-        imap.login(a.user, password(a.user, a.keychain))
+        imap.login(a.user, password(a.password_cmd))
         imap.select("INBOX", readonly=True)
         since = (datetime.date.today() - datetime.timedelta(days=a.days)).strftime("%d-%b-%Y")
         _, data = imap.uid("search", None, "SINCE", since)

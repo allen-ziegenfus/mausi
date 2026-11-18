@@ -166,8 +166,9 @@ Each of these is off until you configure it:
   It gets an optional `YYYY-MM-DD` argument for another day. Adds the Today section and meeting reminders.
 - **`[commands] mail`**: a command that prints unread mail as JSON
   (`{"unread": [...]}`; see `mail_lines` in `mausi-dash`). `mail_open` opens one.
-  `bin/mausi-mail --host imap.example.com --user me@example.com` reads the
-  Inbox over IMAP (read-only), with the password in the macOS Keychain.
+  `bin/mausi-mail --host imap.example.com --user me@example.com --password-cmd
+  "<command>"` reads the Inbox over IMAP (read-only); the command prints the
+  password (a keychain or password manager).
 - **`[commands] reminders`**: a command that prints open reminders or to-dos
   from any app as JSON, `{"items": [{"id", "title", "group", "due", "priority",
   "note", "url"}]}` (`due` is `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM`, local, or
