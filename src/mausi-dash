@@ -162,6 +162,8 @@ MAGENTA = "\033[35m"
 # compact (the dashboard) or detailed (zoomed full screen with z).
 infra_data = None  # {"docker": [...] | None, "k3d": [...], "kube": {...} | None}
 work_data = None   # claude-merge-board's /api/dash.json, or {"error": str}
+if not BOARD_URL:  # the collector never fetches a board then: Tasks reads the overview instead of waiting
+    work_data = {"error": "no board configured"}
 meetings = {"events": [], "synced": None, "error": None}
 meetings_tomorrow = {"events": []}
 mail = None  # the mail command's output: Inbox mail (all of it in zoom, unread otherwise)
