@@ -46,6 +46,8 @@ skip_reasons = ["clear"]         # SessionEnd reasons that don't save
 
 [board]
 url = ""                         # a local board serving /api/dash.json (PRs, Jira); enables the Work sections
+command = ""                     # or a command printing the same JSON, e.g. GitHub only, no server:
+                                 #   "mausi-github --repo me/app --project me/1" (see bin/mausi-github)
 
 [jira]
 site = ""                        # e.g. "https://example.atlassian.net", for ticket links

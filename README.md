@@ -143,7 +143,13 @@ Each of these is off until you configure it:
 
 - **`[board] url`**: a local HTTP service serving `/api/dash.json` with your
   PRs and Jira issues. It adds the PR and Jira sections. mausi doesn't include
-  a board; the shape it expects is in `mausi-dash` (`pr_lines`, `jira_lines`).
+  a board; the shape it expects is in `mausi-dash` (`pr_lines`, `jira_lines`,
+  `project_lines`). Sections whose key the board doesn't send stay hidden.
+- **`[board] command`**: instead of a URL, a command that prints the same JSON
+  (`<command> [--refresh] [pr/<owner>/<repo>/<n>]`), run every 3 minutes. mausi
+  ships one for GitHub, no server needed: `bin/mausi-github --repo me/app
+  --project me/1` lists the open PRs in those repos and the moving items on
+  the GitHub Projects (all statuses but the first and last, or `--status`), via `gh`.
 - **`[commands] calendar`**: a command that prints today's meetings as JSON:
   `{"events": [{"title", "start": "YYYY-MM-DDTHH:MM", "end", "allday", "location", "meet"}], "synced": "…"}`.
   It gets an optional `YYYY-MM-DD` argument for another day. Adds the Today section and meeting reminders.

@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""mausi-github: a board for mausi without a server. Prints the board's JSON
+from GitHub, using `gh` and its login: open PRs in the given repos, and the
+moving items on GitHub Projects. Python 3.8+, standard library only.
+
+    mausi-github --repo me/app --repo me/site --project me/1     # dash.json
+    mausi-github --repo ... pr/<owner>/<repo>/<n>                 # one PR's pop-up
+    mausi-github --project me/1 --status "In progress"            # statuses listed item by item
+                                                                  # (default: all but the first and last)
+
+In mausi's config.toml:
+
+    [board]
+    command = "mausi-github --repo me/app --project me/1"
+
+One GraphQL call per run. Errors go to stderr with a non-zero exit, or as
+{"error": ...} for a pop-up.
+"""
+import argparse
+import datetime
+import json
+import re
+import shutil
+import subprocess
+import sys
+
+REPOS, PROJECTS, STATUSES = [], [], []
+
+PR_FIELDS = """number title url isDraft createdAt updatedAt reviewDecision
+  author { login }
+  commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+  comments(last: 1) { nodes { author { login } } }"""
+ITEM_FIELDS = """
+  status: fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
+  fieldValues(first: 20) { nodes { ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } } } }
+  content {
+    ... on Issue { number title url state updatedAt repository { nameWithOwner } assignees(first: 3) { nodes { login } } }
+    ... on PullRequest { number title url state updatedAt repository { nameWithOwner } assignees(first: 3) { nodes { login } } }
+    ... on DraftIssue { title updatedAt }
+  }"""
+
+
+def gh(*args, timeout=60):
+    if not shutil.which("gh"):
+        raise RuntimeError("gh isn't installed")
+    r = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr.strip() or f"gh exited {r.returncode}").splitlines()[-1][:200])
+    return r.stdout
+
+
+def graphql(query):
+    """The data; partial errors (the user-or-organization lookup always has
+    one) are fine. gh exits non-zero on any error but still prints the data."""
+    if not shutil.which("gh"):
+        raise RuntimeError("gh isn't installed")
+    r = subprocess.run(["gh", "api", "graphql", "-f", f"query={query}"], capture_output=True, text=True, timeout=60)
+    try:
+        out = json.loads(r.stdout)
+    except ValueError:
+        raise RuntimeError((r.stderr.strip() or f"gh exited {r.returncode}").splitlines()[-1][:200])
+    if out.get("errors") and not any((out.get("data") or {}).values()):
+        raise RuntimeError(out["errors"][0].get("message", "GraphQL error")[:200])
+    return out.get("data") or {}
+
+
+def _query():
+    parts = ["viewer { login }"]
+    for i, repo in enumerate(REPOS):
+        owner, name = repo.split("/", 1)
+        parts.append(f'r{i}: repository(owner: {json.dumps(owner)}, name: {json.dumps(name)}) {{ nameWithOwner '
+                     f'pullRequests(states: OPEN, first: 30, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ nodes {{ {PR_FIELDS} }} }} }}')
+    for i, proj in enumerate(PROJECTS):
+        owner, number = proj.split("/")
+        # A project belongs to a user or an organization; ask both, one answers.
+        for kind in ("user", "organization"):
+            parts.append(f'p{i}{kind[0]}: {kind}(login: {json.dumps(owner)}) {{ projectV2(number: {number}) {{ title url '
+                         f'field(name: "Status") {{ ... on ProjectV2SingleSelectField {{ options {{ name }} }} }} '
+                         f'items(first: 100, orderBy: {{field: POSITION, direction: ASC}}) {{ totalCount nodes {{ {ITEM_FIELDS} }} }} }} }}')
+    return "query { " + " ".join(parts) + " }"
+
+
+def day(ts):
+    """GitHub's UTC time -> the local date (YYYY-MM-DD), so ages don't go negative at night."""
+    if not ts:
+        return ""
+    try:
+        return datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d")
+    except ValueError:
+        return ts[:10]
+
+
+def _pr(node, repo, me):
+    ci = (((node.get("commits") or {}).get("nodes") or [{}])[0].get("commit") or {}).get("statusCheckRollup") or {}
+    last = ((node.get("comments") or {}).get("nodes") or [{}])[-1] if (node.get("comments") or {}).get("nodes") else {}
+    author = (node.get("author") or {}).get("login") or "ghost"
+    return {"ref": f"{repo}#{node['number']}", "url": node["url"], "title": node["title"], "draft": node["isDraft"],
+            "created": day(node["createdAt"]), "updated": day(node["updatedAt"]), "author": author,
+            "ci": ci.get("state"), "review": node.get("reviewDecision"),
+            "last_comment": (last.get("author") or {}).get("login") if last else None,
+            "why": [] if author == me else ["your repo"]}
+
+
+def _project(p):
+    options = [o["name"] for o in ((p.get("field") or {}).get("options") or [])]
+    shown = STATUSES or options[1:-1]
+    items, counts = [], {}
+    for n in (p.get("items") or {}).get("nodes") or []:
+        c = n.get("content") or {}
+        status = (n.get("status") or {}).get("name") or "—"
+        counts[status] = counts.get(status, 0) + 1
+        if status not in shown:  # closed issues stay: "to test" ones usually are
+            continue
+        prio = next((v["name"] for v in (n.get("fieldValues") or {}).get("nodes") or []
+                     if v and re.match(r"prio", (v.get("field") or {}).get("name", ""), re.I)), "")
+        repo = (c.get("repository") or {}).get("nameWithOwner")
+        items.append({"status": status, "priority": prio, "title": c.get("title") or "?",
+                      "ref": f"{repo}#{c['number']}" if repo and c.get("number") else "", "url": c.get("url") or p["url"],
+                      "updated": day(c.get("updatedAt")),
+                      "assignees": [a["login"] for a in ((c.get("assignees") or {}).get("nodes") or [])]})
+    items.sort(key=lambda i: (shown.index(i["status"]) if i["status"] in shown else 99, i["priority"] or "~"))
+    return {"title": p["title"], "url": p["url"], "statuses": options, "shown": shown,
+            "counts": counts, "items": items, "total": (p.get("items") or {}).get("totalCount", 0)}
+
+
+def fetch_work():
+    """(the board's /api/dash.json shape, error)."""
+    try:
+        data = graphql(_query())
+    except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as e:
+        return None, f"GitHub: {e}"
+    me = (data.get("viewer") or {}).get("login")
+    mine, others = [], []
+    missing = [repo for i, repo in enumerate(REPOS) if not data.get(f"r{i}")]
+    for i in range(len(REPOS)):
+        r = data.get(f"r{i}") or {}
+        for node in (r.get("pullRequests") or {}).get("nodes") or []:
+            pr = _pr(node, r["nameWithOwner"], me)
+            (others if pr["why"] else mine).append(pr)
+    projects = []
+    for i, name in enumerate(PROJECTS):
+        p = (data.get(f"p{i}u") or {}).get("projectV2") or (data.get(f"p{i}o") or {}).get("projectV2")
+        if p:
+            projects.append(_project(p))
+        else:  # a heading that says so, instead of nothing
+            projects.append({"title": f"{name}: not found", "url": "", "statuses": [], "shown": [],
+                             "counts": {}, "items": [], "total": 0})
+    out = {"source": "github", "me": me}
+    if REPOS:
+        out.update(mine=mine, involved=others, pr_error=f"not found: {', '.join(missing)}" if missing else None)
+    if PROJECTS:
+        out["projects"] = projects
+    return out, None
+
+
+def pr_detail(ref):
+    """A PR pop-up's data (the board's /api/pr/... shape) from `gh pr view`."""
+    m = re.fullmatch(r"([\w.-]+/[\w.-]+)#(\d+)", ref)
+    if not m:
+        return {"error": f"not a PR: {ref}"}
+    try:
+        d = json.loads(gh("pr", "view", m.group(2), "-R", m.group(1), "--json",
+                          "title,state,author,headRefName,additions,deletions,changedFiles,reviewDecision,"
+                          "createdAt,updatedAt,body,statusCheckRollup,comments,reviews,files"))
+    except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as e:
+        return {"error": str(e)}
+    checks = [f"{c.get('name') or c.get('context') or '?'}: {(c.get('conclusion') or c.get('state') or c.get('status') or '?').lower()}"
+              for c in d.get("statusCheckRollup") or []]
+    talk = [{"author": (c.get("author") or {}).get("login", "?"), "created": (c.get("createdAt") or "")[:16].replace("T", " "),
+             "kind": "comment", "body": c.get("body") or ""} for c in d.get("comments") or []]
+    talk += [{"author": (r.get("author") or {}).get("login", "?"), "created": (r.get("submittedAt") or "")[:16].replace("T", " "),
+              "kind": f"review: {(r.get('state') or '').lower()}", "body": r.get("body") or ""} for r in d.get("reviews") or []]
+    talk.sort(key=lambda c: c["created"])
+    return {"title": d["title"], "state": d["state"], "author": (d.get("author") or {}).get("login", "?"),
+            "branch": d.get("headRefName", ""), "review": d.get("reviewDecision"),
+            "changes": f"+{d.get('additions', 0)} −{d.get('deletions', 0)} in {d.get('changedFiles', 0)} files",
+            "created": day(d["createdAt"]), "updated": day(d["updatedAt"]), "body": d.get("body") or "",
+            "checks": checks, "comments": talk, "files": [f["path"] for f in d.get("files") or []]}
+
+
+def main():
+    ap = argparse.ArgumentParser(description="mausi's board JSON from GitHub, via gh.")
+    ap.add_argument("--repo", action="append", default=[], help="owner/name: list its open PRs (repeatable)")
+    ap.add_argument("--project", action="append", default=[], help="owner/number: a GitHub Project (repeatable)")
+    ap.add_argument("--status", action="append", default=[], help="a project status to list item by item (repeatable)")
+    ap.add_argument("--refresh", action="store_true", help="accepted for mausi; every run fetches fresh")
+    ap.add_argument("path", nargs="?", default="dash.json", help="dash.json (default) or pr/<owner>/<repo>/<n>")
+    a = ap.parse_args()
+    REPOS[:] = [r for r in a.repo if re.fullmatch(r"[\w.-]+/[\w.-]+", r)]
+    PROJECTS[:] = [p for p in a.project if re.fullmatch(r"[\w.-]+/\d+", p)]
+    STATUSES[:] = a.status
+    m = re.fullmatch(r"pr/([\w.-]+)/([\w.-]+)/(\d+)", a.path)
+    if m:
+        print(json.dumps(pr_detail(f"{m.group(1)}/{m.group(2)}#{m.group(3)}"), ensure_ascii=False))
+        return 0
+    if a.path != "dash.json":
+        print(json.dumps({"error": f"mausi-github has no {a.path.split('/')[0]}"}))
+        return 0
+    data, err = fetch_work()
+    if err:
+        print(err, file=sys.stderr)
+        return 1
+    print(json.dumps(data, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

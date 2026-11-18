@@ -8,7 +8,9 @@ Platform helpers hide the Linux/macOS differences: the clipboard, opening a
 URL, and looking at another process (its cwd and command line).
 """
 import contextlib
+import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -86,6 +88,7 @@ DEFAULTS = {
     # Optional extensions: each is off until configured.
     "board": {
         "url": "",                          # a local work board serving /api/dash.json (PRs, Jira)
+        "command": "",                      # or a command printing the same JSON (e.g. mausi-github); see board_get
     },
     "jira": {
         "site": "",                         # e.g. https://example.atlassian.net
@@ -345,3 +348,30 @@ def process_args(pid):
         return out.stdout.split()
     except (OSError, subprocess.SubprocessError):
         return []
+
+
+def board_get(path="dash.json", hard=False, timeout=60):
+    """The board's JSON for path ("dash.json", "pr/<owner>/<repo>/<n>",
+    "issue/<KEY>"): from [board] url, or else from [board] command, run as
+    `<command> [--refresh] [<path>]` (no path for dash.json). Raises OSError or
+    ValueError when there's no board or it fails."""
+    url = get("board", "url").rstrip("/")
+    if url:
+        import urllib.request
+        q = "?refresh=1" if hard and path == "dash.json" else ""
+        with urllib.request.urlopen(f"{url}/api/{path}{q}", timeout=timeout) as r:
+            return json.load(r)
+    cmd = shlex.split(os.path.expanduser(get("board", "command")))
+    if not cmd:
+        raise OSError("no board configured")
+    args = (["--refresh"] if hard else []) + ([] if path == "dash.json" else [path])
+    try:
+        r = subprocess.run(cmd + args, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise OSError(f"{os.path.basename(cmd[0])} timed out")
+    if not r.stdout.strip():
+        raise OSError((r.stderr.strip() or f"{os.path.basename(cmd[0])} exited {r.returncode}").splitlines()[-1][:200])
+    return json.loads(r.stdout)
+
+
+BOARD = bool(get("board", "url") or get("board", "command"))  # PR/Jira sections on

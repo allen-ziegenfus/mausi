@@ -62,15 +62,11 @@ def run(cmd, timeout=5):
 # --- sources: each returns (data, error) ----------------------------------
 
 def fetch_board(hard=False):
-    """claude-merge-board's /api/dash.json: PRs, Jira, tasks."""
-    if not BOARD_URL:
-        return None, "no board configured"
-    url = BOARD_URL + "/api/dash.json" + ("?refresh=1" if hard else "")
+    """The board's dash.json ([board] url or command): PRs, Jira, tasks."""
     try:
-        with urllib.request.urlopen(url, timeout=60) as r:
-            return mark_review_merges(cfg.clean(json.load(r))), None
+        return mark_review_merges(cfg.clean(cfg.board_get("dash.json", hard))), None
     except (OSError, ValueError) as e:
-        return None, f"board unreachable ({e})"
+        return None, (f"board unreachable ({e})" if BOARD_URL else f"board command failed ({e})")
 
 
 def mark_review_merges(data):
@@ -296,7 +292,7 @@ def notifications_changed():
 
 # name: (fetch, seconds between fetches, enabled). The order is the file's.
 SOURCES = {
-    "board": (fetch_board, 60, bool(BOARD_URL)),
+    "board": (fetch_board, 60 if BOARD_URL else 180, cfg.BOARD),  # a command (e.g. gh) is slower: every 3 min
     "mail": (fetch_mail, 120, bool(MAIL_CMD)),
     "calendar": (fetch_calendar, 120, bool(CALENDAR_CMD)),
     "notifications": (fetch_notifications, 2, True),  # cheap: re-read only when the log changes

@@ -162,7 +162,7 @@ MAGENTA = "\033[35m"
 # compact (the dashboard) or detailed (zoomed full screen with z).
 infra_data = None  # {"docker": [...] | None, "k3d": [...], "kube": {...} | None}
 work_data = None   # claude-merge-board's /api/dash.json, or {"error": str}
-if not BOARD_URL:  # the collector never fetches a board then: Tasks reads the overview instead of waiting
+if not cfg.BOARD:  # the collector never fetches a board then: Tasks reads the overview instead of waiting
     work_data = {"error": "no board configured"}
 meetings = {"events": [], "synced": None, "error": None}
 meetings_tomorrow = {"events": []}
@@ -974,8 +974,7 @@ def fetch_detail(path, force=False):
         return  # a fetch already running (None), or fresh
     issues[path] = (time.time(), hit[1] if hit else None)
     try:
-        with urllib.request.urlopen(f"{BOARD_URL}/api/{path}", timeout=60) as r:
-            data = cfg.clean(json.load(r))
+        data = cfg.clean(cfg.board_get(path))
     except Exception as e:  # noqa: BLE001 — any failure must clear the "loading" marker
         data = {"error": str(e) or type(e).__name__}
     issues[path] = (time.time(), data)
@@ -1187,8 +1186,7 @@ GITHUB_ME = cfg.get("dash", "github_user")
 
 def board_get(path):
     try:
-        with urllib.request.urlopen(f"{BOARD_URL}/api/{path}", timeout=60) as r:
-            data = cfg.clean(json.load(r))
+        data = cfg.clean(cfg.board_get(path))
         return None if not isinstance(data, dict) or data.get("error") else data
     except Exception:  # noqa: BLE001
         return None
@@ -1445,6 +1443,8 @@ def worktree_for(key):
 
 
 def pr_lines(data, detail=False):
+    if not data.get("error") and "mine" not in data and "involved" not in data:
+        return []
     if data.get("error"):
         return [(f"{BOLD}PRs{RESET} {RED}{data['error']}{RESET}", None)]
 
@@ -1462,7 +1462,7 @@ def pr_lines(data, detail=False):
     lines = []
     # Tickets already closed in Jira (recently closed) don't need closing again.
     done = {j["key"] for j in (data.get("recent") or {}).get("jira", [])}
-    to_close = [i for i in data["to_close"] if i.get("jira") not in done]
+    to_close = [i for i in data.get("to_close") or [] if i.get("jira") not in done]
     if to_close:
         lines.append((f"{BOLD}{YELLOW}Merged — close in Jira ({len(to_close)}){RESET}", None))
         for i in to_close:
@@ -1476,17 +1476,18 @@ def pr_lines(data, detail=False):
                 action.update(pr=i["id"], detail=(i["id"], f"{i['title']}\n(merged)"))
             lines.append((f"  {YELLOW}●{RESET} {i['jira'] or ''} {i['title']}", action))
         lines.append(("", None))
-    if data["forwards"]:
+    if data.get("forwards"):
         lines.append((f"{BOLD}Waiting on {FORWARD_NAME}{RESET} {DIM}({len(data['forwards'])}){RESET}", None))
         lines += rows(data["forwards"])
         lines.append(("", None))
-    lines.append((f"{BOLD}My PRs{RESET} {DIM}({len(data['mine'])}){RESET}"
-                  + (f" {RED}{data['pr_error'][:80]}{RESET}" if data["pr_error"] else ""), None))
-    lines += rows(data["mine"])
+    lines.append((f"{BOLD}My PRs{RESET} {DIM}({len(data.get('mine') or [])}){RESET}"
+                  + (f" {RED}{data['pr_error'][:80]}{RESET}" if data.get("pr_error") else ""), None))
+    lines += rows(data.get("mine") or [])
     involved = data.get("involved") or []
     if involved or data.get("involved_error") or data.get("involved_loading"):
         lines.append(("", None))
-        lines.append((f"{BOLD}Involved{RESET} {DIM}(others' PRs: review requested, mention you, or name your tickets"
+        lines.append((f"{BOLD}Involved{RESET} {DIM}(" + ("others' PRs in your repos" if data.get("source") == "github" else
+                                                          "others' PRs: review requested, mention you, or name your tickets")
                        + (f" · {len(involved)}" if involved else "")
                        + (" · looking…" if data.get("involved_loading") else "") + f"){RESET}"
                        + (f" {RED}{data['involved_error'][:80]}{RESET}" if data.get("involved_error") else ""), None))
@@ -1500,11 +1501,42 @@ def pr_lines(data, detail=False):
     return lines
 
 
+def project_lines(data, detail=False):
+    """Project boards (the board's "projects", e.g. GitHub Projects from
+    mausi-github): the items in the moving statuses, with a count of the rest."""
+    if data.get("error") or "projects" not in data:  # the PRs section shows the error
+        return []
+    lines = []
+    for p in data.get("projects") or []:
+        rest = ", ".join(f"{n} {s}" for s, n in sorted(p["counts"].items(),
+                         key=lambda kv: p["statuses"].index(kv[0]) if kv[0] in p["statuses"] else 99) if s not in p["shown"])
+        if lines:
+            lines.append(("", None))
+        lines.append((f"{BOLD}{p['title']}{RESET} {DIM}({len(p['items'])}" + (f" · {rest}" if rest else "") + f"){RESET}",
+                      {"open": p["url"]}))
+        status = None
+        for i in p["items"]:
+            if i["status"] != status:
+                status = i["status"]
+                lines.append((f"  {CYAN}{status}{RESET}", None))
+            prio = {"hoch": RED, "high": RED, "mittel": YELLOW, "medium": YELLOW}.get(i["priority"].lower(), DIM)
+            action = {"open": i["url"], "detail": (i["ref"] or i["status"], f"{i['title']}\n\n{i['status']}"
+                                                   + (f" · priority {i['priority']}" if i["priority"] else "")
+                                                   + (f" · {', '.join(i['assignees'])}" if i["assignees"] else "")
+                                                   + f" · updated {i['updated']}\n{i['url']}")}
+            lines.append((f"    {prio}{(i['priority'] or '·')[:6]:<6}{RESET} {i['title']}  {DIM}{i['ref'].split('/')[-1]}{RESET}", action))
+            if detail:
+                lines += sub(f"{i['ref']} · updated {i['updated']}" + (f" · {', '.join(i['assignees'])}" if i["assignees"] else ""))
+    return lines or [(f"{BOLD}Projects{RESET} {DIM}none{RESET}", None)]
+
+
 def why_tag(pr):
     """Why an Involved PR is listed: review requests first, then my tickets
     (preferring one the PR only references over its own title's)."""
     why = pr.get("why") or []
     keys = sorted((w for w in why if TICKET_RE.match(w)), key=lambda k: k in pr["title"])
+    if "your repo" in why:
+        return f"{DIM}in your repo · {pr.get('author') or '?'}{RESET}"
     if "review requested" in why:
         return f"{YELLOW}review requested{RESET}"
     if keys:
@@ -1550,7 +1582,7 @@ def sprint_text(i):
 def jira_lines(data, detail=False, width=None, which="assigned"):
     """One of two sections: tickets assigned to me, or ones I created that
     someone else (or nobody) has."""
-    if data.get("error"):
+    if data.get("error") or "jira" not in data:  # a board without Jira (e.g. mausi-github)
         return []
     created_only = which == "created"
     tickets = [i for i in data["jira"] if (i.get("mine") is False) == created_only]
@@ -1560,7 +1592,7 @@ def jira_lines(data, detail=False, width=None, which="assigned"):
     lines = [(f"{BOLD}{heading}{RESET} {DIM}({len(tickets)} open"
               + (" · z for all" if created_only and not detail and len(tickets) > JIRA_CREATED_MAX else "")
               + f"){RESET}"
-              + (f" {RED}{data['jira_error'][:80]}{RESET}" if data["jira_error"] and not created_only else ""), None)]
+              + (f" {RED}{data['jira_error'][:80]}{RESET}" if data.get("jira_error") and not created_only else ""), None)]
     if created_only and not detail:
         tickets = tickets[:JIRA_CREATED_MAX]  # newest first; the rest are in the zoomed view
     for i, depth in nest_tickets(tickets):
@@ -1596,6 +1628,8 @@ def jira_lines(data, detail=False, width=None, which="assigned"):
 
 def recent_lines(data, detail=False, width=None):
     """PRs merged/closed and tickets done in the last couple of days."""
+    if "recent" not in data and not data.get("error"):  # a board that doesn't send it
+        return []
     recent = data.get("recent") or {}
     prs, tickets = recent.get("prs", []), recent.get("jira", [])
     if not prs and not tickets and not recent.get("error"):
@@ -2292,6 +2326,8 @@ def section_lines(name, rows, detail=False, width=None, history=False):
         return [] if name == "pinned" else [(f"{BOLD}{name.capitalize()}{RESET}", None)] + LOADING
     if name == "prs":
         return pr_lines(work, detail)
+    if name == "projects":
+        return project_lines(work, detail)
     if name == "jira":
         return jira_lines(work, detail, width)
     if name == "jira_created":
@@ -2306,18 +2342,18 @@ def section_lines(name, rows, detail=False, width=None, history=False):
 
 
 VIEW_SECTIONS = {"Now": ("you", "today", "needs", "sessions", "pinned", "tasks", "docker", "kube"),
-                 "Work": ("slack", "notifications", "mail", "notes", "prs", "jira", "jira_created", "recent")}
+                 "Work": ("slack", "notifications", "mail", "notes", "prs", "projects", "jira", "jira_created", "recent")}
 # Sections whose source isn't set up are left out: the board (PRs, Jira), the
 # calendar and mail commands, and the notification log (Linux capture).
 _SOURCE = {"today": bool(cfg.get("commands", "calendar")), "mail": bool(cfg.get("commands", "mail")),
-           "prs": bool(BOARD_URL), "jira": bool(BOARD_URL), "jira_created": bool(BOARD_URL), "recent": bool(BOARD_URL),
+           "prs": cfg.BOARD, "projects": cfg.BOARD, "jira": cfg.BOARD, "jira_created": cfg.BOARD, "recent": cfg.BOARD,
            "needs": bool(cfg.get("triage", "enabled")),
            "slack": os.path.exists(NOTIFICATIONS) or bool(cfg.get("notifications", "capture")),
            "notifications": os.path.exists(NOTIFICATIONS) or bool(cfg.get("notifications", "capture")),
            "docker": bool(shutil.which("docker")), "kube": bool(shutil.which("kubectl") or shutil.which("k3d"))}
 VIEW_SECTIONS = {view: tuple(n for n in names if _SOURCE.get(n, True)) for view, names in VIEW_SECTIONS.items()}
 SECTION_TITLES = {"you": "You", "today": "Today", "needs": "Needs you", "sessions": "Sessions", "docker": "Docker", "kube": "Kubernetes",
-                  "notifications": "Notifications", "slack": "Slack", "mail": "Mail", "notes": "Notes", "prs": "PRs", "jira": "Jira: assigned to me", "jira_created": "Jira: created by me", "recent": "Recently closed", "tasks": "Tasks",
+                  "notifications": "Notifications", "slack": "Slack", "mail": "Mail", "notes": "Notes", "prs": "PRs", "projects": "Projects", "jira": "Jira: assigned to me", "jira_created": "Jira: created by me", "recent": "Recently closed", "tasks": "Tasks",
                   "pinned": "Now (pinned tasks)"}
 
 
