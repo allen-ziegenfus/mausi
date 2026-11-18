@@ -164,11 +164,18 @@ Each of these is off until you configure it:
 - **`[commands] calendar`**: a command that prints today's meetings as JSON:
   `{"events": [{"title", "start": "YYYY-MM-DDTHH:MM", "end", "allday", "location", "meet"}], "synced": "…"}`.
   It gets an optional `YYYY-MM-DD` argument for another day. Adds the Today section and meeting reminders.
-- **`[commands] mail`**: a command that prints unread mail as JSON
-  (`{"unread": [...]}`; see `mail_lines` in `mausi-dash`). `mail_open` opens one.
-  `bin/mausi-mail --host imap.example.com --user me@example.com --password-cmd
-  "<command>"` reads the Inbox over IMAP (read-only); the command prints the
-  password (a keychain or password manager).
+- **`[commands] mail`**: a command that prints the Inbox as JSON
+  (`{"unread": [...], "messages": [...]}`; see `mail_lines` in `mausi-dash`).
+  `mail_open` opens one. `bin/mausi-mail --host imap.example.com --user
+  me@example.com --password-cmd "<command>"` reads the Inbox over IMAP
+  (read-only); the command prints the password (a keychain or password manager).
+  With `[mail] viewer = true`, Enter on a mail opens it in a box over the
+  dashboard, as text, and d moves it to the trash; the zoomed Mail section
+  shows the selected mail's text below the list. The mail command must take
+  `--raw ID` and `--delete ID`, as `mausi-mail` does. With `[mail] render`, a
+  command that turns an HTML file into a PNG (the contract is in
+  `bin/mausi-mail-view`), `h` shows the mail rendered with kitty's graphics,
+  `i` with its remote images, and `f` full screen.
 - **`[commands] reminders`**: a command that prints open reminders or to-dos
   from any app as JSON, `{"items": [{"id", "title", "group", "due", "priority",
   "note", "url"}]}` (`due` is `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM`, local, or

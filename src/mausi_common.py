@@ -104,6 +104,12 @@ DEFAULTS = {
     },
     "projects": {},                         # Projects section: group name = [folders or globs], e.g.
                                             # personal = ["~/src/app", "~/src/tools-*"]
+    "mail": {
+        "viewer": False,                    # Enter on a mail: a box over the dashboard; d deletes (the mail
+                                            # command must take --raw ID and --delete ID, as mausi-mail does)
+        "render": "",                       # HTML to PNG, for the rendered view (h): <cmd> IN.html OUT.png
+                                            # --width CSS_PX --max-pixels N [--network]; "" = text only
+    },
     "commands": {
         "calendar": "",                     # prints today's meetings as JSON (optional arg: YYYY-MM-DD)
         "mail": "",                         # prints unread mail as JSON

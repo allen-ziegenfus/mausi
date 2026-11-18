@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""mausi-mail-view: one mail, full screen in kitty. HTML is rendered by a
+render command (mausi's [mail] render) to a PNG and drawn with kitty's
+graphics protocol; without one, and for plain text, the mail stays text.
+Python 3.9+, standard library only.
+
+    mausi-mail-view [--render COMMAND] --id=MESSAGE-ID -- MAIL-COMMAND...
+
+The render command is run as `COMMAND IN.html OUT.png --width CSS_PX
+--max-pixels N [--network]`: lay the page out that wide and shoot it whole as
+a PNG no taller (or wider) than N pixels; without --network nothing outside
+may load. The page it gets is already made safe here (scripts and redirects
+out, a Content-Security-Policy that blocks remote content, frames and local
+files; cid: images inlined), and sets document.title to "H:<height>" once
+loaded, for renderers that need the height. Without --network the renderer
+must not reach the network itself either (no DNS prefetch or the like): the
+policy only covers what the page loads.
+
+MAIL-COMMAND is mausi's [commands] mail; it must take --raw MESSAGE-ID (print
+the mail) and --delete MESSAGE-ID. The dashboard opens this in a kitty
+overlay (Enter on a mail).
+
+A mail whose text loses nothing (few images and tables) is shown as text;
+h switches to the rendered HTML and back.
+
+Keys: j/k or the wheel scroll, Space/b page, g/G top/bottom, i load the
+remote images (the sender then sees the mail was opened), d delete (asks),
+o open the HTML in the browser, q or Esc close.
+"""
+import argparse
+import base64
+import email
+import email.header
+import email.policy
+import fcntl
+import glob
+import html
+import os
+import re
+import select
+import shlex
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import tty
+
+WIDTH = 820  # CSS pixels the mail is laid out in
+KITTY_MAX = 9990  # kitty refuses images taller (or wider) than 10000 pixels: the renderer's limit
+IMAGE_ID = 4711
+
+
+CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def clean(text):
+    """Text from a mail, safe for the terminal: no control characters (an
+    ESC in a subject or body could write the clipboard or move the cursor)."""
+    return CONTROLS.sub("", text or "")
+
+
+def safe_page_path():
+    """A 0600 file in a 0700 folder of the user's cache, for "open in the
+    browser" (not a fixed name in a shared /tmp)."""
+    base = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "mausi")
+    os.makedirs(base, mode=0o700, exist_ok=True)
+    os.chmod(base, 0o700)
+    fd, path = tempfile.mkstemp(prefix="mail-", suffix=".html", dir=base)
+    os.close(fd)
+    for old in glob.glob(os.path.join(base, "mail-*.html")):  # the last few are enough
+        if old != path and os.path.getmtime(old) < os.path.getmtime(path) - 3600:
+            os.remove(old)
+    return path
+
+
+def header(msg, name):
+    parts = []
+    for chunk, charset in email.header.decode_header(msg.get(name, "") or ""):
+        if isinstance(chunk, bytes):
+            try:
+                chunk = chunk.decode(charset or "utf-8", "replace")
+            except LookupError:
+                chunk = chunk.decode("utf-8", "replace")
+        parts.append(chunk)
+    return clean(re.sub(r"\s+", " ", "".join(parts)).strip())
+
+
+def body_parts(msg):
+    """(html, text, {cid: data URI}) of the mail."""
+    html_part = text_part = None
+    cids = {}
+    for part in msg.walk():
+        ctype = part.get_content_type()
+        if part.is_multipart():
+            continue
+        cid = (part.get("Content-ID") or "").strip("<> ")
+        if cid and ctype.startswith("image/"):
+            data = part.get_payload(decode=True) or b""
+            cids[cid] = f"data:{ctype};base64,{base64.b64encode(data).decode()}"
+            continue
+        if part.get_filename() and part.get_content_disposition() == "attachment":
+            continue
+        try:
+            content = part.get_content()
+        except (LookupError, KeyError, ValueError):
+            content = (part.get_payload(decode=True) or b"").decode("utf-8", "replace")
+        if ctype == "text/html" and html_part is None:
+            html_part = content
+        elif ctype == "text/plain" and text_part is None:
+            text_part = content
+    return html_part, text_part, cids
+
+
+def html_text(source):
+    """The HTML's text, with its paragraphs and line breaks."""
+    t = re.sub(r"(?is)<(style|script|head)\b.*?</\1>", "", source)
+    t = re.sub(r"(?i)<br\s*/?>", "\n", t)
+    t = re.sub(r"(?i)</(p|div|tr|li|h[1-6]|table|blockquote)>", "\n", t)
+    t = re.sub(r"(?i)<li\b[^>]*>", "• ", t)
+    t = html.unescape(re.sub(r"<[^>]+>", "", t)).replace("\xa0", " ")
+    t = "\n".join(re.sub(r"[ \t]+", " ", l).strip() for l in t.splitlines())
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+
+def plain_enough(source, text):
+    """The mail as text when that loses nothing: an HTML part with at most
+    one real image (not a tracking pixel) and few tables (a designed mail has
+    dozens), and a text part with
+    at least half its words (else the HTML's own text). None: render it."""
+    if not source:
+        return text or ""
+    images = [m for m in re.findall(r"(?is)<img\b[^>]*>", source)
+              if not re.search(r"""(?i)\b(width|height)\s*=\s*["']?[01]\b""", m)]
+    if len(images) > 1 or len(re.findall(r"(?i)<table\b", source)) > 5:  # quoted replies have a few
+        return None
+    words = len(html_text(source).split())
+    if text and len(text.split()) >= words / 2:
+        return text
+    return html_text(source)
+
+
+def page_html(source, cids, network=False):
+    """The mail's HTML, safe to render. A Content-Security-Policy comes first:
+    no script but our height probe (its nonce), no frames, forms or local
+    files, images only inline (data:) unless network (then http/https too).
+    Scripts and refresh/redirect metas are also taken out, cid: images
+    inlined, on a white page of WIDTH."""
+    import secrets
+    nonce = secrets.token_hex(12)
+    remote = " https: http:" if network else ""
+    csp = (f"default-src 'none'; img-src data:{remote}; style-src 'unsafe-inline'{remote}; "
+           f"font-src data:{remote}; script-src 'nonce-{nonce}'; form-action 'none'; base-uri 'none'")
+    # (the CSP is what holds; these just leave less for a renderer to act on)
+    tag = r"(?:[^>\"']|\"[^\"]*\"|'[^']*')*>"  # the rest of a tag, quoted values and all
+    source = re.sub(r"(?is)<script\b" + tag + r".*?</script\s*>", "", source)
+    while True:  # leftovers and nested tricks (<scr<script>ipt>): no script tag survives
+        stripped = re.sub(r"(?i)<\s*/?\s*script\b" + tag + "?", "", source)
+        if stripped == source:
+            break
+        source = stripped
+    # every <meta> (refresh redirects, whatever the attribute order), <base> and
+    # <link> (prefetch, preconnect, stylesheets) of the mail's own goes
+    source = re.sub(r"(?i)<\s*(meta|base|link)\b" + tag, "", source)
+    source = re.sub(r"(?i)\bcid:([^\"'\s)>]+)", lambda m: cids.get(m.group(1), m.group(0)), source)
+    head = (f'<meta http-equiv="Content-Security-Policy" content="{csp}">'
+            f'<meta charset="utf-8"><meta name="viewport" content="width={WIDTH}">'
+            '<style>html{background:#fff}body{margin:12px;max-width:100%;overflow-wrap:break-word}'
+            'img{max-width:100%;height:auto}</style>')
+    probe = (f"<script nonce='{nonce}'>addEventListener('load',()=>{{document.title='H:'+Math.ceil("
+             "Math.max(document.documentElement.scrollHeight,document.body?document.body.scrollHeight:0))})</script>")
+    return f"<!doctype html><html><head>{head}</head><body>{source}{probe}</body></html>"
+
+
+def render(command, page, workdir, network=False):
+    """PNG of the page (path, pixel width, pixel height) from the render
+    command, or None."""
+    if not command:
+        return None
+    path = os.path.join(workdir, "mail.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(page)
+    png = os.path.join(workdir, "mail-net.png" if network else "mail.png")
+    try:
+        subprocess.run(command + [path, png, "--width", str(WIDTH), "--max-pixels", str(KITTY_MAX)]
+                       + (["--network"] if network else []), capture_output=True, timeout=90)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if not os.path.exists(png):
+        return None
+    with open(png, "rb") as f:
+        head = f.read(24)
+    if len(head) < 24 or not head.startswith(b"\x89PNG"):  # not a PNG, or cut off
+        return None
+    w, h = struct.unpack(">II", head[16:24])
+    if w > 10000 or h > 10000:  # kitty wouldn't show it
+        return None
+    return png, w, h
+
+
+class Screen:
+    def __init__(self):
+        self.fd = sys.stdin.fileno()
+        self.saved = termios.tcgetattr(self.fd)
+
+    def __enter__(self):
+        tty.setcbreak(self.fd)
+        self.write("\033[?1049h\033[?25l\033[?1000h\033[?1006h")  # alt screen, no cursor, wheel as SGR
+        return self
+
+    def __exit__(self, *exc):
+        self.write(f"\033_Ga=d,d=I,i={IMAGE_ID},q=2\033\\\033[?1000l\033[?1006l\033[?25h\033[?1049l")
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+
+    @staticmethod
+    def write(s):
+        if os.environ.get("MAUSI_MAIL_VIEW_LOG"):  # debugging: what goes to the terminal
+            with open(os.environ["MAUSI_MAIL_VIEW_LOG"], "a") as f:
+                f.write(repr(s[:400]) + "\n")
+        sys.stdout.write(s)
+        sys.stdout.flush()
+
+    def size(self):
+        """rows, cols, pixel width, pixel height."""
+        rows, cols, xpix, ypix = struct.unpack("HHHH", fcntl.ioctl(self.fd, termios.TIOCGWINSZ, b"\0" * 8))
+        return rows, cols, xpix or cols * 9, ypix or rows * 18
+
+    def key(self):
+        data = os.read(self.fd, 64)
+        while data.endswith(b"\033") or re.search(rb"\033\[[<0-9;]*$", data):
+            if not select.select([self.fd], [], [], 0.05)[0]:
+                break
+            data += os.read(self.fd, 64)
+        text = data.decode(errors="ignore")
+        m = re.match(r"\033\[<(\d+);\d+;\d+[mM]", text)
+        if m:
+            return {"64": "up", "65": "down"}.get(m.group(1), "")
+        return {"\033[A": "up", "\033[B": "down", "\033[5~": "pgup", "\033[6~": "pgdn", "\033[H": "g",
+                "\033[F": "G"}.get(text, text[:1])
+
+
+def view(scr, msg, image, text, actions):
+    """The loop: headers on top, the mail below, a key line at the bottom.
+    Returns when the mail is closed (or deleted)."""
+    top, status = 0, ""
+    head = [f"\033[1m{header(msg, 'Subject') or '(no subject)'}\033[0m",
+            f"\033[2m{header(msg, 'From')} · {header(msg, 'Date')}\033[0m"]
+    def send(img):
+        scr.write(f"\033_Ga=d,d=I,i={IMAGE_ID},q=2\033\\"
+                  f"\033_Ga=t,f=100,t=f,i={IMAGE_ID},q=2;{base64.b64encode(img[0].encode()).decode()}\033\\")
+    rendered = image  # h switches between it and the text
+    if image:
+        send(image)
+    while True:
+        rows, cols, xpix, ypix = scr.size()
+        cell_w, cell_h = xpix / cols, ypix / rows
+        body_rows = max(1, rows - len(head) - 2)
+        # Line by line, not ESC[2J: a clear screen frees kitty images that
+        # aren't placed yet, the one just sent among them.
+        out = ["".join(f"\033[{r};1H\033[2K" for r in range(1, rows + 1)) + "\033[H",
+               "\r\n".join(h[:cols * 3] for h in head), "\r\n"]
+        if image:
+            _, w, h = image
+            # Its own size (one image pixel per screen pixel), centred; only
+            # a window narrower than the mail scales it down.
+            img_cols = max(1, min(cols, int(w / cell_w + 0.5)))
+            left = (cols - img_cols) // 2
+            per_row = w / img_cols * cell_h / cell_w  # image pixels in one terminal row
+            total = max(1, int(h / per_row + 0.999))
+            top = max(0, min(top, total - body_rows))
+            y = int(top * per_row)
+            slice_h = min(h - y, int(body_rows * per_row))
+            shown = max(1, int(slice_h / per_row + 0.999))
+            out.append(f"\033[{len(head) + 2};{left + 1}H\033_Ga=d,d=i,i={IMAGE_ID},q=2\033\\"
+                       f"\033_Ga=p,i={IMAGE_ID},x=0,y={y},w={w},h={slice_h},c={img_cols},r={shown},C=1,q=2\033\\")
+        else:
+            lines = [l for para in text.splitlines() for l in (wrap(para, cols) or [""])]
+            total = len(lines)
+            top = max(0, min(top, total - body_rows))
+            out.append("\r\n" + "\r\n".join(lines[top:top + body_rows]))
+        pct = 100 if total <= body_rows else int(100 * (top + body_rows) / total)
+        toggle = ("h text · " if image else "h rendered · ") if actions.get("text_ok") and (rendered or actions.get("render")) else ""
+        keys = (toggle + "j/k scroll · space page · " + ("i images · " if image and actions.get("images") else "")
+                + "d delete · " + ("o browser · " if actions.get("open") else "") + "q close")
+        out.append(f"\033[{rows};1H\033[7m {keys} \033[0m \033[2m{min(pct, 100)}%{RESET}{status}")
+        scr.write("".join(out))
+        status = ""
+        k = scr.key()
+        if k in ("q", "\033", ""):
+            return
+        if k in ("j", "down"):
+            top += 3
+        elif k in ("k", "up"):
+            top -= 3
+        elif k in (" ", "pgdn", "f"):
+            top += body_rows - 2
+        elif k in ("b", "pgup"):
+            top -= body_rows - 2
+        elif k == "g":
+            top = 0
+        elif k == "G":
+            top = total
+        elif k == "h" and toggle:
+            if image:
+                scr.write(f"\033_Ga=d,d=i,i={IMAGE_ID},q=2\033\\")
+                image, top = None, 0
+            else:
+                if not rendered and actions.get("render"):
+                    scr.write(f"\033[{rows};1H\033[2K\033[2m rendering…\033[0m")
+                    rendered = actions.pop("render")()
+                if rendered:
+                    image, top = rendered, 0
+                    send(image)
+                else:
+                    status = "  couldn't render it"
+        elif k == "i" and image and actions.get("images"):
+            scr.write(f"\033[{rows};1H\033[2K\033[2m loading the remote images…\033[0m")
+            better = actions.pop("images")()
+            if better:
+                image = rendered = better
+                send(image)
+            else:
+                status = "  couldn't render it with images"
+        elif k == "o" and actions.get("open"):
+            actions["open"]()
+            status = "  opened in the browser"
+        elif k == "d":
+            scr.write(f"\033[{rows};1H\033[2K\033[1;33m Delete this mail (move it to the trash)? y/n \033[0m")
+            if scr.key() in ("y", "Y"):
+                ok, said = actions["delete"]()
+                scr.write(f"\033[{rows};1H\033[2K {said}")
+                if ok:
+                    select.select([scr.fd], [], [], 1.2)
+                    return
+                scr.key()
+
+
+RESET = "\033[0m"
+
+
+def wrap(line, cols):
+    line = line.expandtabs(4).rstrip()
+    return [line[i:i + cols] for i in range(0, len(line), cols)] if line else []
+
+
+def main():
+    argv = sys.argv[1:]
+    if "--" not in argv:
+        sys.exit(__doc__)
+    i = argv.index("--")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--render", default="", help="the render command (mausi's [mail] render)")
+    ap.add_argument("message_id", nargs="?")
+    ap.add_argument("--id", help="the mail's Message-ID (also as the argument; --id= when it starts with -)")
+    a = ap.parse_args(argv[:i])
+    a.message_id = a.id or a.message_id
+    if not a.message_id:
+        sys.exit(__doc__)
+    mail_cmd = argv[i + 1:]
+    r = subprocess.run(mail_cmd + [f"--raw={a.message_id}"], capture_output=True, timeout=60)
+    if r.returncode != 0 or not r.stdout:
+        sys.exit(f"couldn't fetch the mail: {r.stderr.decode(errors='replace').strip()[:300]}")
+    msg = email.message_from_bytes(r.stdout, policy=email.policy.default)
+    source, text, cids = body_parts(msg)
+    text = clean(text) if text else text
+
+    def delete():
+        d = subprocess.run(mail_cmd + [f"--delete={a.message_id}"], capture_output=True, text=True, timeout=60)
+        said = (d.stdout or d.stderr).strip().splitlines()
+        return d.returncode == 0, (said[-1] if said else f"exit {d.returncode}")[:120]
+
+    actions = {"delete": delete}
+    plain = plain_enough(source, text)
+    plain = clean(plain) if plain else plain
+    with tempfile.TemporaryDirectory(prefix="mausi-mail-") as workdir:
+        image = None
+        if source:
+            page = page_html(source, cids)
+            renderer = shlex.split(os.path.expanduser(a.render))
+            if plain is not None:  # good enough as text: render only when asked (h)
+                text = plain
+                actions["text_ok"] = True
+                if renderer:
+                    actions["render"] = lambda: render(renderer, page, workdir)
+            else:
+                sys.stdout.write("\033[2m rendering…\033[0m\r")
+                sys.stdout.flush()
+                image = render(renderer, page, workdir)
+            def open_in_browser():  # images allowed there, scripts still not
+                keep = safe_page_path()
+                with open(keep, "w", encoding="utf-8") as f:
+                    f.write(page_html(source, cids, network=True))
+                subprocess.run(["open", keep] if sys.platform == "darwin" else ["xdg-open", keep])
+            actions["open"] = open_in_browser
+            if renderer:
+                actions["images"] = lambda: render(renderer, page_html(source, cids, network=True), workdir, network=True)
+            if not image:  # no browser to render with: the HTML as text
+                text = text or clean(html_text(source))
+        with Screen() as scr:
+            view(scr, msg, image, text or "(no text)", actions)
+
+
+if __name__ == "__main__":
+    main()

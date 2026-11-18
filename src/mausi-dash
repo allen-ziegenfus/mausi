@@ -107,6 +107,8 @@ BOARD_TASKS = {"open": BOARD_URL + "/tasks"} if BOARD_URL else {}  # the board's
 CALENDAR_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "calendar")))  # [] = no Today section
 MAIL_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "mail")))          # [] = no Mail section
 MAIL_OPEN_CMD = cfg.get("commands", "mail_open")                                  # "{id}" = the Message-ID
+MAIL_VIEWER = bool(MAIL_CMD and cfg.get("mail", "viewer"))                       # Enter: the mail box; d: delete
+RENDER_CMD = shlex.split(os.path.expanduser(cfg.get("mail", "render")))          # [] = mail as text only
 PICKER = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "kitty", "picker.py")
 WORKTREE_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "worktree")))  # [] = no w key
 VIEWS = ("Now", "Work")
@@ -1843,7 +1845,8 @@ def mail_lines(detail=False, width=None):
         color = DIM if m["list"] or not m["to_me"] or m.get("read") else ""
         if detail:
             star = (f"{CYAN}●{RESET}" if not m.get("read") else " ") + star
-        action = {"open": m["url"], "message_id": m.get("message_id"), "task_seed": mail_task_seed(m),
+        action = {"open": m["url"], "message_id": m.get("message_id"), "subject": m["subject"],
+                  "task_seed": mail_task_seed(m),
                   "detail": (f"{m['from']} · {m['date'].replace('T', ' ')}",
                                                m["subject"] + ("\n\n" + m["body"] if m.get("body") else ""))}
         lines.append((f"  {DIM}{when:>5}{RESET} {star} {color}{fit(m['from'], 22)} {color}{m['subject']}{RESET}", action))
@@ -2710,6 +2713,7 @@ class Ui:
         self.task_title = None  # the selected task, kept selected when the list reorders
         self.pick = None  # a: {"what", "done": fn(task action) -> message, "back": (tasks, tview, zoom)} while picking a task
         self.popup = None  # [title, text, action] while the detail box is open
+        self.mailbox = None  # {"id", "subject", "from", "scroll", "net", "total"} while a mail is open
         self.popup_scroll = 0
         self.zoom = None   # section name while zoomed in (z)
         self.searches = {}  # each list's filter (/), see search
@@ -2861,6 +2865,51 @@ class Ui:
     def scroll_popup(self, delta):
         self.popup_scroll = max(0, self.popup_scroll + delta)
 
+    def mailbox_lines(self, width, height):
+        """The open mail: a box over the dashboard, the rendered mail in it."""
+        mb = self.mailbox
+        box_w, box_h = max(30, width - 6), max(8, height - 4)
+        row, col = 3, (width - box_w) // 2  # 1-based row of the top border, 0-based column
+        inner_w, inner_h = box_w - 4, box_h - 4
+        title = clip(f"{BOLD}{mb['subject']}{RESET}{CYAN}", box_w - 8)
+        keys = ("j/k ↑↓ space scroll · d delete · " + ("" if mb["net"] or not RENDER_CMD else "i images · ")
+                + "o browser · f full screen · q close")
+        out = [f"\033[{row};{col + 1}H{CYAN}╭─ {title} " + "─" * max(0, box_w - 5 - visible_len(title)) + f"╮{RESET}",
+               f"\033[{row + 1};{col + 1}H{CYAN}│{RESET} {fit(DIM + mb['from'] + RESET, inner_w)} {CYAN}│{RESET}"]
+        for r in range(row + 2, row + box_h - 1):
+            out.append(f"\033[{r};{col + 1}H{CYAN}│{RESET}{' ' * (box_w - 2)}{CYAN}│{RESET}")
+        kind, what = mail_view(mb["id"], mb["html"], mb["net"])
+        if kind == "busy" and mb["net"]:  # the plain rendering while the images load
+            kind, what = mail_view(mb["id"], True)
+        info = _mail_info.get(mb["id"]) or {}
+        if info.get("has_html") and RENDER_CMD:
+            keys = ("h text · " if mb["html"] or mb["net"] else "h rendered · ") + keys
+        seq = ""
+        if kind == "text":
+            lines = wrap_text(what, min(inner_w, 110))
+            mb["total"] = len(lines)
+            mb["scroll"] = max(0, min(mb["scroll"], mb["total"] - inner_h))
+            left = col + 2 + max(0, (inner_w - min(inner_w, 110)) // 2)
+            seq = "".join(f"\033[{row + 2 + i};{left + 1}H{l}"
+                          for i, l in enumerate(lines[mb["scroll"]:mb["scroll"] + inner_h]))
+        elif kind == "png":
+            seq, mb["total"] = place_png(what, row + 2, col + 2, inner_h, inner_w, mb["scroll"])
+            mb["scroll"] = max(0, min(mb["scroll"], mb["total"] - inner_h))
+        else:
+            seq = f"\033[{row + 3};{col + 4}H{DIM}{'no preview — o opens it in the browser' if kind == 'failed' else 'loading…'}{RESET}"
+        if kind in ("text", "png"):
+            pct = 100 if mb["total"] <= inner_h else int(100 * (mb["scroll"] + inner_h) / mb["total"])
+            keys += f" · {min(pct, 100)}%"
+        if mb["net"] and _preview["busy"]:
+            keys += " · loading images…"
+        out.append(f"\033[{row + box_h - 1};{col + 1}H{CYAN}╰─{RESET} {DIM}{clip(keys, box_w - 8)}{RESET} {CYAN}"
+                   + "─" * max(0, box_w - 5 - visible_len(clip(keys, box_w - 8))) + f"╯{RESET}")
+        return "".join(out) + seq
+
+    def scroll_mail(self, step):
+        mb = self.mailbox
+        mb["scroll"] = max(0, min(mb["scroll"] + step, max(0, mb.get("total", 0) - 1)))
+
     def popup_box(self, width, height):
         """The detail box as (row, col, lines) to draw over the body."""
         title, text, action = self.popup
@@ -3009,7 +3058,17 @@ class Ui:
         ]
         body_height = max(1, height - len(header) - 1)
 
-        if self.zoom:
+        preview = ""
+        if self.zoom == "mail" and MAIL_VIEWER and body_height >= 12:
+            # The list on top, the selected mail's text below (Enter: rendered).
+            list_height = body_height // 2
+            body = self.column(2, width, list_height, True)
+            body.append(f"{DIM}{'─' * width}{RESET}")
+            body += [""] * (body_height - list_height - 1)
+            mid = (self.action() or {}).get("message_id")
+            if mid:
+                preview = mail_text_preview(mid, len(header) + list_height + 2, body_height - list_height - 1, width)
+        elif self.zoom:
             body = self.column(2, width, body_height, True)
         elif self.tasks and two:
             left_width = (width - 3) // 2
@@ -3031,14 +3090,17 @@ class Ui:
             body = self.column(self.view, width, body_height, True)
 
         overlay = ""
-        if self.popup:
+        if self.mailbox:
+            overlay = self.mailbox_lines(width, height)
+        elif self.popup:
             row, col, box = self.popup_box(width, height)
             overlay = "".join(f"\033[{row + i + 1};{col + 1}H{line}" for i, line in enumerate(box))
         if self.prompt or self.confirm:
             ask = (f"{self.prompt['label']} {self.prompt['text']}█" if self.prompt
                    else f"{self.confirm[0]} [y/N]")
             overlay += f"\033[{height};1H\033[7m{fit(' ' + ask, width)}\033[0m"
-        sys.stdout.write("\033[H\033[2J" + "\n".join(header + body) + overlay)
+        # (ESC[2J also frees the open mail's image: the overlay sends it again)
+        sys.stdout.write("\033[H\033[2J" + "\n".join(header + body) + preview + overlay)
         sys.stdout.flush()
 
 
@@ -3046,9 +3108,197 @@ _launched = {}  # folder -> when Enter on Projects started Claude there
 LAUNCH_GRACE = 15  # seconds
 
 
+# --- the open mail (Enter on a mail: a box over the dashboard) ------------------
+PREVIEW_DIR = os.path.join(cfg.CACHE_DIR, "mail-png")  # rendered mails, newest PREVIEW_KEEP kept
+PREVIEW_KEEP = 40
+PREVIEW_IMAGE = 4712  # kitty image id
+_preview = {"busy": None, "failed": {}}  # failed: key -> when (tried again after PREVIEW_RETRY)
+PREVIEW_RETRY = 60
+_viewer = {}
+
+
+def viewer_module():
+    """bin/mausi-mail-view as a module: its rendering, here in the background."""
+    if "m" not in _viewer:
+        import importlib.machinery
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "bin", "mausi-mail-view")
+        loader = importlib.machinery.SourceFileLoader("mausi_mail_view", path)
+        spec = importlib.util.spec_from_loader("mausi_mail_view", loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        _viewer["m"] = module
+    return _viewer["m"]
+
+
+_mail_info = {}  # message id -> {"text": its text, "has_html": bool, "page": its HTML to render}
+
+
+def mail_view(message_id, html=False, network=False):
+    """How to show the mail: ("text", str) unless html (or network) is asked
+    for and it has HTML; ("png", (path, w, h)) rendered; ("busy", None) while
+    it's fetched or rendered (in a thread; one at a time); ("failed", None).
+    network: rendered with its remote images."""
+    import hashlib
+    info = _mail_info.get(message_id)
+    key = message_id + (" +net" if network else "")
+    if info is not None and (not (html or network) or not info["has_html"] or not RENDER_CMD):
+        return "text", info["text"]
+    path = os.path.join(PREVIEW_DIR, hashlib.sha1(key.encode()).hexdigest() + ".png")
+    if info is not None and os.path.exists(path):
+        with open(path, "rb") as f:
+            w, h = __import__("struct").unpack(">II", f.read(24)[16:24])
+        return "png", (path, w, h)
+    if time.time() - _preview["failed"].get(key, 0) < PREVIEW_RETRY:
+        return "failed", None
+    if not _preview["busy"]:
+        _preview["busy"] = key
+        threading.Thread(target=_mail_worker, args=(message_id, path, html or network, network),
+                         daemon=True).start()
+    return "busy", None
+
+
+def _mail_worker(message_id, path, render, network):
+    """Fetch the mail (once) and, if render, render it."""
+    import email
+    import email.policy
+    import html as _html
+    import tempfile
+    key = message_id + (" +net" if network else "")
+    try:
+        v = viewer_module()
+        info = _mail_info.get(message_id)
+        if info is None:
+            r = subprocess.run(MAIL_CMD + [f"--raw={message_id}"], capture_output=True, timeout=60)
+            if r.returncode != 0 or not r.stdout:
+                _preview["failed"][key] = time.time()
+                return
+            msg = email.message_from_bytes(r.stdout, policy=email.policy.default)
+            source, text, cids = v.body_parts(msg)
+            # its text: the text part if it has most of the words, else the HTML's own
+            good = v.plain_enough(source, text) if source else text
+            plain = good if good is not None else (text if text and len(text.split()) >= len(
+                v.html_text(source).split()) / 2 else v.html_text(source))
+            # cleaned: mail text must not reach the terminal with escape sequences
+            info = {"text": cfg.clean(plain) or "(no text)", "has_html": bool(source),
+                    "source": source or f"<pre>{_html.escape(text or '')}</pre>", "cids": cids}
+            if len(_mail_info) > 200:
+                _mail_info.clear()
+            _mail_info[message_id] = info
+        if not render or not info["has_html"]:
+            return
+        if os.path.exists(path):
+            return
+        with tempfile.TemporaryDirectory(prefix="mausi-preview-") as work:
+            page = v.page_html(info["source"], info["cids"], network=network)
+            out = v.render(RENDER_CMD, page, work, network=network)
+            if not out:
+                _preview["failed"][key] = time.time()
+                return
+            os.makedirs(PREVIEW_DIR, mode=0o700, exist_ok=True)
+            os.chmod(PREVIEW_DIR, 0o700)
+            os.chmod(out[0], 0o600)  # whatever mode the renderer gave it
+            shutil.move(out[0], path)
+        old = sorted((os.path.join(PREVIEW_DIR, n) for n in os.listdir(PREVIEW_DIR)), key=os.path.getmtime)
+        for f in old[:-PREVIEW_KEEP]:
+            os.remove(f)
+    except Exception:  # noqa: BLE001 — a preview must never take the dashboard down
+        cfg.log_error("mail preview")
+        _preview["failed"][key] = time.time()
+    finally:
+        _preview["busy"] = None
+
+
+def wrap_text(text, width):
+    out = []
+    for para in text.splitlines():
+        out += textwrap.wrap(para.expandtabs(4), width, replace_whitespace=False, drop_whitespace=True) or [""]
+    return out
+
+
+def cell_size():
+    try:
+        import fcntl
+        import struct
+        import termios
+        rows, cols, xpix, ypix = struct.unpack("HHHH", fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8))
+        return (xpix or cols * 9) / cols, (ypix or rows * 18) / rows
+    except OSError:
+        return 9, 18
+
+
+def place_png(png, top_row, left_col, rows, width, scroll=0):
+    """kitty graphics showing png (path, w, h) at its own size (narrower if
+    width is less), centred in width cells from left_col, rows tall from
+    top_row, starting scroll terminal rows down. Returns (escapes, rows the
+    whole picture takes)."""
+    import base64
+    path, w, h = png
+    cell_w, cell_h = cell_size()
+    cols = max(1, min(width, int(w / cell_w + 0.5)))
+    per_row = w / cols * cell_h / cell_w  # image pixels per terminal row
+    total = max(1, int(h / per_row + 0.999))
+    scroll = max(0, min(scroll, total - rows))
+    y = int(scroll * per_row)
+    shown = max(1, min(rows, total - scroll))
+    left = left_col + (width - cols) // 2
+    return (f"\033_Ga=t,f=100,t=f,i={PREVIEW_IMAGE},q=2;{base64.b64encode(path.encode()).decode()}\033\\"
+            f"\033[{top_row};{left + 1}H\033_Ga=p,i={PREVIEW_IMAGE},x=0,y={y},w={w},"
+            f"h={max(1, min(h - y, int(shown * per_row)))},c={cols},r={shown},C=1,q=2\033\\"), total
+
+
+def mail_text_preview(message_id, top_row, rows, width):
+    """The zoomed Mail section's bottom half: the selected mail's text."""
+    kind, what = mail_view(message_id)
+    if kind != "text":
+        return f"\033[{top_row};3H{DIM}{'no preview' if kind == 'failed' else 'loading…'}{RESET}"
+    lines = wrap_text(what, max(20, min(width - 4, 110)))[:rows]
+    return "".join(f"\033[{top_row + i};3H{clip(l, width - 4)}" for i, l in enumerate(lines))
+
+
+def view_mail(message_id):
+    """The mail in a kitty overlay (bin/mausi-mail-view); the Mail section is
+    fetched again once it's closed (it may have been deleted)."""
+    viewer = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "bin", "mausi-mail-view")
+    render = ["--render", shlex.join(RENDER_CMD)] if RENDER_CMD else []
+    r = subprocess.run(["kitty", "@", "launch", "--type=overlay", "--title", "mail", viewer, *render, f"--id={message_id}",
+                        "--", *MAIL_CMD],
+                       capture_output=True, text=True)
+    window = r.stdout.strip()
+    if r.returncode != 0 or not window.isdigit():
+        return f"couldn't open the viewer: {(r.stderr or r.stdout).strip()[:80]}"
+
+    def wait():
+        while subprocess.run(["kitty", "@", "ls", "--match", f"id:{window}"], capture_output=True).returncode == 0:
+            time.sleep(1)
+        if ctx:
+            ctx.refresh("mail")
+    threading.Thread(target=wait, daemon=True).start()
+    return ""
+
+
+def delete_mail(message_id, subject):
+    try:
+        r = subprocess.run(MAIL_CMD + [f"--delete={message_id}"], capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return "no answer from the mail server in 30 s: it may or may not be deleted"
+    if r.returncode != 0:
+        return f"couldn't delete it: {(r.stderr or r.stdout).strip()[:80]}"
+    with lock:
+        if mail:
+            for key in ("unread", "messages"):
+                if isinstance(mail.get(key), list):
+                    mail[key] = [m for m in mail[key] if m.get("message_id") != message_id]
+    if ctx:
+        ctx.refresh("mail")
+    return f"deleted: {subject[:60]}"
+
+
 def perform(action, verb="open"):
     if not action:
         return
+    if verb == "full" and action.get("message_id") and MAIL_VIEWER:
+        return view_mail(action["message_id"])
     if verb == "open" and action.get("dir"):  # a task's worktree: a shell tab there
         subprocess.run(["kitty", "@", "launch", "--type=tab", "--tab-title", os.path.basename(action["dir"]),
                         "--cwd", action["dir"]], capture_output=True)
@@ -3411,6 +3661,7 @@ def main():
             pa = ui.popup[2] if ui.popup else {}
             loading = ((pa.get("issue") and issue_data(pa["issue"]) is None)
                        or (pa.get("pr") and detail_data(pr_path(pa["pr"])) is None))
+            loading = loading or bool(_preview["busy"])  # a mail preview is on its way
             ready, _, _ = select.select([sys.stdin], [], [], 0.3 if loading else SESSION_REFRESH)
             if not ready:
                 continue
@@ -3420,7 +3671,9 @@ def main():
                 if key.startswith("wheel"):
                     direction, column = key.split(":")
                     step = 1 if direction == "wheeldown" else -1  # kitty already sends several events per notch
-                    if ui.popup:
+                    if ui.mailbox:
+                        ui.scroll_mail(step)
+                    elif ui.popup:
                         ui.scroll_popup(step)
                     else:
                         ui.wheel(step, int(column))
@@ -3488,6 +3741,46 @@ def _process_key(ui, key, wakes):
             ui.prompt["text"] += key
         if live and ui.prompt and ui.prompt["text"] != text_before:
             ui.search_edited()
+        return False
+    if ui.mailbox:
+        mb = ui.mailbox
+        page = max(1, shutil.get_terminal_size().lines - 10)
+        if key in ("j", "down"):
+            ui.scroll_mail(3)
+        elif key in ("k", "up"):
+            ui.scroll_mail(-3)
+        elif key in (" ", "pgdn"):
+            ui.scroll_mail(page)
+        elif key in ("b", "pgup"):
+            ui.scroll_mail(-page)
+        elif key == "g":
+            mb["scroll"] = 0
+        elif key == "G":
+            mb["scroll"] = mb.get("total", 0)
+        elif key == "i" and not mb["net"]:
+            mb["net"], mb["scroll"] = True, 0
+        elif key == "h":
+            mb["html"], mb["net"], mb["scroll"] = not (mb["html"] or mb["net"]), False, 0
+        elif key == "o":
+            info = _mail_info.get(mb["id"]) or {}
+            if info.get("source"):
+                v = viewer_module()
+                path = v.safe_page_path()  # 0600 in ~/.cache/mausi; images allowed there, scripts not
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(v.page_html(info["source"], info["cids"], network=True))
+                ui.say("opening it in the browser" if cfg.open_url("file://" + path) else "couldn't open the browser", 2)
+        elif key == "f":
+            ui.mailbox = None
+            ui.say(perform(mb["action"], "full") or "", 2)
+        elif key == "d":
+            mid, subject = mb["id"], mb["subject"]
+
+            def gone():
+                ui.mailbox = None
+                return delete_mail(mid, subject)
+            ui.confirm = (f"Delete the mail (move it to the trash): {subject[:70]}?", gone)
+        elif key in ("\033", "q"):
+            ui.mailbox = None
         return False
     if ui.popup:
         if key in ("j", "down"):
@@ -3621,6 +3914,11 @@ def handle(ui, key, wakes):
         ui.move(10)
     elif key == "pgup":
         ui.move(-10)
+    elif key in ("\n", "\r") and MAIL_VIEWER and (ui.action() or {}).get("message_id"):
+        action = ui.action()
+        ui.mailbox = {"id": action["message_id"], "subject": action.get("subject", ""), "scroll": 0, "net": False,
+                      "html": False,  # its text first; h renders it (less untrusted HTML through a browser)
+                      "from": (action.get("detail") or ("", ""))[0], "action": action}
     elif key in ("\n", "\r"):
         action = ui.action()
         if action and action.get("zoom"):
@@ -3730,8 +4028,11 @@ def handle(ui, key, wakes):
         elif action and action.get("reminder"):
             rid, title = action["reminder"], action["reminder_title"]
             ui.confirm = (f"Mark the reminder done: {title[:80]}?", lambda: complete_reminder(rid, title))
+        elif action and action.get("message_id") and MAIL_VIEWER:
+            mid, subject = action["message_id"], action.get("subject", "")
+            ui.confirm = (f"Delete the mail (move it to the trash): {subject[:70]}?", lambda: delete_mail(mid, subject))
         else:
-            ui.say("d works on a task, reminder, notification, snippet or quick note", 2)
+            ui.say("d works on a task, reminder, mail, notification, snippet or quick note", 2)
     elif key == "D":
         ui.confirm = ("Dismiss all notifications up to now (and close them on the desktop)?",
                       lambda: (dismiss(), close_desktop(recent_notification_ids()), "all dismissed")[-1])

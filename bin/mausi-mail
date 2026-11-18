@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""mausi-mail: the Inbox over IMAP, for mausi's [commands] mail. Read-only:
-nothing is marked read. Python 3.9+, standard library only.
+"""mausi-mail: the Inbox over IMAP, for mausi's [commands] mail. Listing is
+read-only (nothing is marked read). Python 3.9+, standard library only.
 
     mausi-mail --host imap.example.com --user me@example.com --password-cmd "CMD"
                [--me alias@example.com] [--web URL]
@@ -10,9 +10,17 @@ command line; use an app password if the account has 2FA), or
 $MAUSI_MAIL_PASSWORD. Prints {"unread": [...], "messages": [...]}: the
 last --days days of the Inbox (default 14), newest first, in the fields
 mausi's Mail section reads.
+
+    mausi-mail ... --raw MESSAGE-ID      # the whole mail (RFC 822), still unread
+    mausi-mail ... --delete MESSAGE-ID   # move it to the trash folder
+
+Each listing also keeps the listed mails whole in --cache (default
+~/.cache/mausi/mail, readable only by you; mails no longer listed are
+removed), so --raw is instant for them.
 """
 import argparse
 import datetime
+import hashlib
 import email
 import email.header
 import email.utils
@@ -26,6 +34,38 @@ import subprocess
 import sys
 
 MAX = 60  # messages fetched at most
+CACHE_MAX = 5 << 20  # mails bigger than this (attachments) aren't cached
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "mausi", "mail")
+
+
+def cache_path(cache, message_id):
+    return os.path.join(cache, hashlib.sha1(message_id.encode()).hexdigest() + ".eml")
+
+
+def cache_sync(imap, cache, listed):
+    """Keep the listed mails whole in cache: fetch the missing ones (not too
+    big), remove those no longer listed. listed: {message_id: (uid, size)}."""
+    os.makedirs(cache, mode=0o700, exist_ok=True)
+    os.chmod(cache, 0o700)  # also when it was there already, more open
+    want = {cache_path(cache, mid): (uid, size) for mid, (uid, size) in listed.items() if mid}
+    for name in os.listdir(cache):
+        path = os.path.join(cache, name)
+        if name.endswith(".eml") and path not in want:
+            os.remove(path)
+    missing = [(path, uid) for path, (uid, size) in want.items() if not os.path.exists(path) and size <= CACHE_MAX]
+    for i in range(0, len(missing), 10):
+        batch = dict((uid, path) for path, uid in missing[i:i + 10])
+        _, rows = imap.uid("fetch", b",".join(batch), "(UID BODY.PEEK[])")
+        for row in rows:
+            if not isinstance(row, tuple):
+                continue
+            uid = re.search(rb"UID (\d+)", row[0])
+            path = batch.get(uid.group(1)) if uid else None
+            if path:
+                fd = os.open(path + ".part", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(row[1])
+                os.replace(path + ".part", path)
 
 
 def password(command):
@@ -48,7 +88,10 @@ def text(value):
             except LookupError:  # a charset Python doesn't know
                 chunk = chunk.decode("utf-8", "replace")
         parts.append(chunk)
-    return re.sub(r"\s+", " ", "".join(parts)).strip()
+    return CONTROLS.sub("", re.sub(r"\s+", " ", "".join(parts)).strip())
+
+
+CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")  # what never leaves here: ESC and the like
 
 
 def snippet(msg, limit=600):
@@ -63,8 +106,127 @@ def snippet(msg, limit=600):
                 if want == "text/html":
                     body = re.sub(r"(?is)<(script|style).*?</\1>|<[^>]+>", " ", body)
                     body = re.sub(r"&nbsp;|&#160;", " ", body)
-                return re.sub(r"\s+", " ", body).strip()[:limit]
+                return CONTROLS.sub("", re.sub(r"\s+", " ", body).strip())[:limit]
     return ""
+
+
+def utf7_name(raw):
+    """An IMAP folder name (modified UTF-7, e.g. Caf&AOk-) as text; a
+    malformed one stays as it is."""
+    import base64
+    import binascii
+    try:
+        return re.sub(r"&([^-]*)-", lambda m: "&" if not m.group(1) else base64.b64decode(
+            m.group(1).replace(",", "/") + "=" * (-len(m.group(1)) % 4)).decode("utf-16-be"), raw)
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return raw
+
+
+MESSAGE_ID_RE = re.compile(r"[^\s\x00-\x1f\x7f\"'\\()<>]+")
+
+
+def message_id(value):
+    """A Message-ID header's id (no <>, folding whitespace removed)."""
+    return re.sub(r"\s+", "", value or "").strip("<>")
+
+
+def safe_id(value):
+    """The header's id if it's usable as it is, else ""."""
+    mid = message_id(value)
+    return mid if MESSAGE_ID_RE.fullmatch(mid or "") else ""
+
+
+def checked_id(mid):
+    """mid if it can go into an IMAP or a local-copy command as it is; ids come
+    from mail, so one with spaces, quotes, brackets or control characters
+    (an attempt to add commands) is refused."""
+    if not mid or not MESSAGE_ID_RE.fullmatch(mid):
+        raise SystemExit(f"not a usable Message-ID: {mid!r}")
+    return mid
+
+
+def folders(imap):
+    """[(name for SELECT, name as text, flags)] of the selectable folders."""
+    out = []
+    _, rows = imap.list()
+    for row in rows or []:
+        if isinstance(row, tuple):  # the name as a literal: (b'(flags) "/" {n}', b'name')
+            row = re.sub(rb"\{\d+\}$", b"", row[0]) + b'"' + row[1].replace(b'"', b'\\"') + b'"'
+        m = re.match(rb'\(([^)]*)\) (?:"[^"]*"|NIL) (.+)', row or b"")
+        if not m or b"\\Noselect" in m.group(1):
+            continue
+        name = m.group(2).decode()
+        bare = name[1:-1] if name.startswith('"') and name.endswith('"') else name
+        out.append((name, utf7_name(bare), m.group(1).decode()))
+    return out
+
+
+def trash_folder(imap):
+    """The folder flagged \\Trash (its name depends on the account's language)."""
+    for name, _, flags in folders(imap):
+        if "\\Trash" in flags:
+            return name
+    raise SystemExit("no trash folder (\\Trash) on the server")
+
+
+def find(imap, wanted, readonly=True):
+    """(folder, uid) of the mail in the Inbox, which is left selected."""
+    mid = checked_id(wanted)
+    if imap.select("INBOX", readonly=readonly)[0] == "OK":
+        _, data = imap.uid("search", None, "HEADER", "Message-ID", f'"{mid}"')
+        uids = data[0].split() if data and data[0] else []
+        if uids:
+            # HEADER matches substrings: take the mail whose id is exactly this one
+            _, rows = imap.uid("fetch", b",".join(uids), "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+            for r in reversed(rows or []):
+                if isinstance(r, tuple):
+                    got = email.message_from_bytes(r[1]).get("Message-ID")
+                    uid = re.search(rb"UID (\d+)", r[0])
+                    if uid and message_id(got) == mid:
+                        return "INBOX", uid.group(1)
+    raise SystemExit(f"no mail with Message-ID {mid} in INBOX")
+
+
+def summary(meta, raw, mine, web, folder=None):
+    """One mail as the list shows it (from its flags and its first bytes)."""
+    flags = re.search(rb"FLAGS \(([^)]*)\)", meta)
+    flags = flags.group(1).decode() if flags else ""
+    msg = email.message_from_bytes(raw)
+    try:
+        when = email.utils.parsedate_to_datetime(msg["Date"]).astimezone()
+    except (TypeError, ValueError):
+        when = datetime.datetime.now().astimezone()
+    name, addr = email.utils.parseaddr(text(msg["From"]))
+    to = {x[1].lower() for x in email.utils.getaddresses([text(msg.get("To")), text(msg.get("Cc"))])}
+    out = {"from": name or addr, "from_addr": addr, "subject": text(msg["Subject"]) or "(no subject)",
+           "date": when.strftime("%Y-%m-%dT%H:%M"), "read": "\\Seen" in flags, "starred": "\\Flagged" in flags,
+           "list": bool(msg.get("List-Id") or msg.get("List-Unsubscribe")), "to_me": bool(to & mine),
+           # an id that couldn't be used safely (quotes, brackets, spaces) isn't given out at all:
+           # it could be typed into a shell or a command
+           "message_id": safe_id(msg.get("Message-ID")), "url": web, "body": snippet(msg)}
+    if folder:
+        out["folder"] = folder
+    return out
+
+
+def act(imap, a):
+    """--raw / --delete: one mail in the Inbox, by its Message-ID."""
+    if a.raw:
+        _, uid = find(imap, a.raw)
+        _, rows = imap.uid("fetch", uid, "(BODY.PEEK[])")
+        sys.stdout.buffer.write(next(r[1] for r in rows if isinstance(r, tuple)))
+        return 0
+    trash = trash_folder(imap)
+    _, uid = find(imap, a.delete, readonly=False)
+    typ, data = imap.uid("move", uid, trash)
+    if typ != "OK":
+        raise SystemExit(f"move to {trash} failed: {data}")
+    try:
+        os.remove(cache_path(a.cache, a.delete))
+    except OSError:
+        pass
+    print(f"moved to {utf7_name(trash.strip(chr(34)))}")
+    return 0
 
 
 def main():
@@ -76,37 +238,51 @@ def main():
     ap.add_argument("--me", action="append", default=[], help="another address of mine, for 'to me' (repeatable)")
     ap.add_argument("--days", type=int, default=14)
     ap.add_argument("--web", default="", help="URL the mail opens at (the webmail), e.g. https://mail.example.com")
+    one = ap.add_mutually_exclusive_group()
+    one.add_argument("--raw", metavar="MESSAGE-ID", help="print that mail whole (not marked read)")
+    one.add_argument("--delete", metavar="MESSAGE-ID", help="move that mail to the trash folder")
+    ap.add_argument("--cache", default=CACHE, help=f"where listed mails are kept whole (default {CACHE}; '' = nowhere)")
     a = ap.parse_args()
+    if a.raw and a.cache and os.path.exists(cache_path(a.cache, a.raw)):  # no connection needed
+        with open(cache_path(a.cache, a.raw), "rb") as f:
+            sys.stdout.buffer.write(f.read())
+        return 0
     mine = {a.user.lower(), *(m.lower() for m in a.me)}
 
-    try:
+    secret = password(a.password_cmd)
+
+    def connect():
         imap = imaplib.IMAP4_SSL(a.host, a.port, ssl_context=ssl.create_default_context(), timeout=30)
-        imap.login(a.user, password(a.password_cmd))
+        imap.login(a.user, secret)
+        return imap
+
+    try:
+        imap = connect()
+        if a.raw or a.delete:
+            try:
+                return act(imap, a)
+            finally:
+                imap.logout()
         imap.select("INBOX", readonly=True)
         since = (datetime.date.today() - datetime.timedelta(days=a.days)).strftime("%d-%b-%Y")
         _, data = imap.uid("search", None, "SINCE", since)
         uids = data[0].split()[-MAX:]
-        messages = []
+        messages, listed = [], {}
         if uids:
-            _, rows = imap.uid("fetch", b",".join(uids), "(UID FLAGS BODY.PEEK[]<0.20000>)")
+            _, rows = imap.uid("fetch", b",".join(uids), "(UID FLAGS RFC822.SIZE BODY.PEEK[]<0.20000>)")
             for row in rows:
                 if not isinstance(row, tuple):
                     continue
-                meta, raw = row
-                flags = re.search(rb"FLAGS \(([^)]*)\)", meta)
-                flags = flags.group(1).decode() if flags else ""
-                msg = email.message_from_bytes(raw)
+                m = summary(row[0], row[1], mine, a.web)
+                uid, size = re.search(rb"UID (\d+)", row[0]), re.search(rb"RFC822.SIZE (\d+)", row[0])
+                if uid:
+                    listed[m["message_id"]] = (uid.group(1), int(size.group(1)) if size else 0)
+                messages.append(m)
+            if a.cache:
                 try:
-                    when = email.utils.parsedate_to_datetime(msg["Date"]).astimezone()
-                except (TypeError, ValueError):
-                    when = datetime.datetime.now().astimezone()
-                name, addr = email.utils.parseaddr(text(msg["From"]))
-                to = {x[1].lower() for x in email.utils.getaddresses([text(msg.get("To")), text(msg.get("Cc"))])}
-                messages.append({
-                    "from": name or addr, "from_addr": addr, "subject": text(msg["Subject"]) or "(no subject)",
-                    "date": when.strftime("%Y-%m-%dT%H:%M"), "read": "\\Seen" in flags, "starred": "\\Flagged" in flags,
-                    "list": bool(msg.get("List-Id") or msg.get("List-Unsubscribe")), "to_me": bool(to & mine),
-                    "message_id": (msg.get("Message-ID") or "").strip("<> "), "url": a.web, "body": snippet(msg)})
+                    cache_sync(imap, a.cache, listed)
+                except (imaplib.IMAP4.error, OSError) as e:  # the list still counts
+                    print(f"cache: {e}", file=sys.stderr)
         imap.logout()
     except (imaplib.IMAP4.error, OSError) as e:
         print(f"IMAP {a.host}: {e}", file=sys.stderr)
