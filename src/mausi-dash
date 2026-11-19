@@ -619,7 +619,7 @@ def maybe_remind_meeting():
         reminded[name] = parse_time(e["start"])
         write_atomic(MEETING_REMINDED, json.dumps(reminded))
         cmd = [os.path.join(os.path.dirname(os.path.realpath(__file__)), "mausi-break"), "--meeting", e["title"],
-               "--start", str(int(parse_time(e["start"])))]
+               "--start", str(int(parse_time(e["start"]))), "--end", str(int(parse_time(e["end"])))]
         if e.get("meet"):
             cmd += ["--meet", e["meet"]]
         if e.get("location"):

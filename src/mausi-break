@@ -8,7 +8,7 @@ I've been going for an hour without a break (not counting calls and meetings).
 The same screen announces a meeting that is about to start.
 
     mausi-break --since <epoch>   # when the current stretch started
-    mausi-break --meeting TITLE --start <epoch> [--meet URL] [--where TEXT]
+    mausi-break --meeting TITLE --start <epoch> [--end <epoch>] [--meet URL] [--where TEXT]
 
 Meeting keys: Enter/j joins (opens the Meet link) and closes, q/Esc closes.
 
@@ -68,7 +68,7 @@ def key(timeout):
     return os.read(sys.stdin.fileno(), 32).decode(errors="ignore") if ready else None
 
 
-OPTIONS = ("--meeting", "--start", "--meet", "--where", "--since")
+OPTIONS = ("--meeting", "--start", "--end", "--meet", "--where", "--since")
 
 
 def arg(name, default=None):
@@ -86,10 +86,13 @@ def arg(name, default=None):
 
 
 def meeting():
-    """Count down to the meeting's start; Enter/j joins, q/Esc closes."""
+    """Count down to the meeting's start; Enter/j joins, q/Esc closes. It
+    closes itself once the meeting is over, so ones that opened while I was
+    away don't pile up."""
     title, start = arg("--meeting"), float(arg("--start", time.time()))
+    end = float(arg("--end", start + 3600))
     meet, where = arg("--meet"), arg("--where")
-    while True:
+    while time.time() < end:
         left = start - time.time()
         if left > 0:
             when = f"in {int(left) // 60}:{int(left) % 60:02d}"
