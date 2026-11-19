@@ -4,12 +4,17 @@ read-only (nothing is marked read). Python 3.9+, standard library only.
 
     mausi-mail --host imap.example.com --user me@example.com --password-cmd "CMD"
                [--me alias@example.com] [--web URL]
+    mausi-mail --host imap.gmail.com --user-cmd "CMD" --token-cmd "CMD" ...
 
 The password is what --password-cmd prints (a keychain or password manager's
 command line; use an app password if the account has 2FA), or
-$MAUSI_MAIL_PASSWORD. Prints {"unread": [...], "messages": [...]}: the
-last --days days of the Inbox (default 14), newest first, in the fields
-mausi's Mail section reads.
+$MAUSI_MAIL_PASSWORD. With --token-cmd, a command that prints an OAuth2
+access token (for accounts without app passwords; e.g. one that asks GNOME
+Online Accounts), it signs in with XOAUTH2 instead. --user-cmd prints the
+user name, in place of --user.
+
+Prints {"unread": [...], "messages": [...]}: the last --days days of the
+Inbox (default 14), newest first, in the fields mausi's Mail section reads.
 
     mausi-mail ... --raw MESSAGE-ID      # the whole mail (RFC 822), still unread
     mausi-mail ... --delete MESSAGE-ID   # move it to the trash folder
@@ -89,6 +94,14 @@ def password(command):
     if r.returncode != 0 or not r.stdout.strip():
         raise SystemExit(f"no password from --password-cmd: {r.stderr.strip()[:200]}")
     return r.stdout.rstrip("\n")
+
+
+def run_secret(command, flag):
+    """What a --*-cmd prints (first line), or exit."""
+    r = subprocess.run(shlex.split(os.path.expanduser(command)), capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        raise SystemExit(f"nothing from {flag}: {r.stderr.strip()[:200]}")
+    return r.stdout.strip().splitlines()[0]
 
 
 def text(value):
@@ -410,8 +423,10 @@ def main():
     ap = argparse.ArgumentParser(description="The Inbox over IMAP as mausi's mail JSON.")
     ap.add_argument("--host", required=True)
     ap.add_argument("--port", type=int, default=993)
-    ap.add_argument("--user", required=True)
+    ap.add_argument("--user", default="")
+    ap.add_argument("--user-cmd", default="", help="a command that prints the user name, in place of --user")
     ap.add_argument("--password-cmd", default="", help="a command that prints the password")
+    ap.add_argument("--token-cmd", default="", help="a command that prints an OAuth2 access token: XOAUTH2, no password")
     ap.add_argument("--me", action="append", default=[], help="another address of mine, for 'to me' (repeatable)")
     ap.add_argument("--days", type=int, default=14)
     ap.add_argument("--web", default="", help="URL the mail opens at (the webmail), e.g. https://mail.example.com")
@@ -428,6 +443,10 @@ def main():
     ap.add_argument("--all-folders", action="store_true", help="--search the trash, spam, drafts and templates too")
     ap.add_argument("--cache", default=CACHE, help=f"where listed mails are kept whole (default {CACHE}; '' = nowhere)")
     a = ap.parse_args()
+    if a.user_cmd and not a.user:
+        a.user = run_secret(a.user_cmd, "--user-cmd")
+    if not a.user:
+        ap.error("give --user or --user-cmd")
     if a.raw and a.cache and os.path.exists(cache_path(a.cache, a.raw)):  # no connection needed
         with open(cache_path(a.cache, a.raw), "rb") as f:
             sys.stdout.buffer.write(f.read())
@@ -450,11 +469,15 @@ def main():
         except (OSError, subprocess.TimeoutExpired) as e:  # the server, then
             print(f"local: {e}", file=sys.stderr)
 
-    secret = password(a.password_cmd)
+    token = run_secret(a.token_cmd, "--token-cmd") if a.token_cmd else None
+    secret = None if token else password(a.password_cmd)
 
     def connect():
         imap = imaplib.IMAP4_SSL(a.host, a.port, ssl_context=ssl.create_default_context(), timeout=30)
-        imap.login(a.user, secret)
+        if token:
+            imap.authenticate("XOAUTH2", lambda _: f"user={a.user}\x01auth=Bearer {token}\x01\x01".encode())
+        else:
+            imap.login(a.user, secret)
         return imap
 
     try:

@@ -170,6 +170,9 @@ Each of these is off until you configure it:
   `mail_open` opens one. `bin/mausi-mail --host imap.example.com --user
   me@example.com --password-cmd "<command>"` reads the Inbox over IMAP
   (read-only); the command prints the password (a keychain or password manager).
+  Where an account allows no app passwords (Gmail, Microsoft 365), give
+  `--token-cmd "<command>"` instead: it prints an OAuth2 access token, e.g. one
+  from GNOME Online Accounts, and `--user-cmd` can print the user name.
   With `[mail] viewer = true`, Enter on a mail opens it in a box over the
   dashboard, as text, and d moves it to the trash; the zoomed Mail section
   shows the selected mail's text below the list. The mail command must take
