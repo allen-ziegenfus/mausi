@@ -1870,6 +1870,8 @@ def mail_lines(detail=False, width=None):
         # Mailing lists and mail not addressed to me are dimmed.
         color = DIM if m["list"] or not m["to_me"] or m.get("read") else ""
         star = (f"{CYAN}●{RESET}" if not m.get("read") else " ") + star
+        if m.get("message_id") in _deleting:  # its delete is running (in the background)
+            color, star = DIM, "⏳"
         action = {"open": m["url"], "message_id": m.get("message_id"), "subject": m["subject"],
                   "task_seed": mail_task_seed(m),
                   "detail": (f"{m['from']} · {m['date'].replace('T', ' ')}",
@@ -3120,6 +3122,10 @@ class Ui:
             tabs += f"  {YELLOW}/{self.query()}{RESET} {DIM}({matches} match{'' if matches == 1 else 'es'} · Esc clears){RESET}"
         if self.flash and time.time() < self.flash[1]:
             keyline = f"{YELLOW}{self.flash[0]}{RESET}"
+        elif _deleting:
+            subjects = list(_deleting.values())
+            more = f" (+{len(subjects) - 1} more)" if len(subjects) > 1 else ""
+            keyline = f"{YELLOW}⏳ deleting: {subjects[0][:60]}{more}…{RESET}"
         else:
             keyline = f"{DIM}{keys}{RESET}"
         return tabs, keyline
@@ -3362,6 +3368,30 @@ def mail_folder_args(message_id):
         if m.get("message_id") == message_id and m.get("folder") and m["folder"] != "INBOX":
             return ["--folder", m["folder"]]
     return []
+
+
+_deleting = {}  # message id -> subject, while its delete runs
+
+
+def delete_mail_in_background(ui, wakes, message_id, subject):
+    """delete_mail in a thread, so the dashboard keeps going: the key line
+    says what's being deleted meanwhile and the mail's row shows ⏳."""
+    if message_id in _deleting:
+        return "already deleting it"
+    _deleting[message_id] = subject
+
+    def run():
+        try:
+            said = delete_mail(message_id, subject)
+        except Exception as e:  # noqa: BLE001 - say it rather than lose it with the thread
+            said = f"couldn't delete it: {type(e).__name__}: {str(e)[:60]}"
+        finally:
+            _deleting.pop(message_id, None)
+        ui.say(said, 4)
+        wakes[1].set()
+    threading.Thread(target=run, daemon=True).start()
+    wakes[1].set()
+    return None
 
 
 def delete_mail(message_id, subject):
@@ -3806,7 +3836,9 @@ def _process_key(ui, key, wakes):
         question, fn = ui.confirm
         ui.confirm = None
         if key in ("y", "Y"):
-            ui.say(fn())
+            said = fn()
+            if said:  # (one that runs in the background says so itself)
+                ui.say(said)
             wakes[1].set()
         else:
             ui.say("cancelled", 2)
@@ -3871,7 +3903,7 @@ def _process_key(ui, key, wakes):
 
             def gone():
                 ui.mailbox = None
-                return delete_mail(mid, subject)
+                return delete_mail_in_background(ui, wakes, mid, subject)
             ui.confirm = (f"Delete the mail (move it to the trash): {subject[:70]}?", gone)
         elif key in ("\033", "q"):
             ui.mailbox = None
@@ -4136,7 +4168,7 @@ def handle(ui, key, wakes):
             ui.confirm = (f"Mark the reminder done: {title[:80]}?", lambda: complete_reminder(rid, title))
         elif action and action.get("message_id") and MAIL_VIEWER:
             mid, subject = action["message_id"], action.get("subject", "")
-            ui.confirm = (f"Delete the mail (move it to the trash): {subject[:70]}?", lambda: delete_mail(mid, subject))
+            ui.confirm = (f"Delete the mail (move it to the trash): {subject[:70]}?", lambda: delete_mail_in_background(ui, wakes, mid, subject))
         else:
             ui.say("d works on a Needs-you item, task, reminder, mail, notification, snippet or quick note", 2)
     elif key == "D":
