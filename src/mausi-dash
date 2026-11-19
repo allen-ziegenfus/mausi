@@ -2814,6 +2814,10 @@ class Ui:
         self.mailbox = None  # {"id", "subject", "from", "scroll", "net", "total"} while a mail is open
         self.popup_scroll = 0
         self.zoom = None   # section name while zoomed in (z)
+        self.preview_focus = False  # zoomed Mail: Tab moved into the preview below the list (j/k scroll it)
+        self.preview_scroll = 0     # its scroll, in terminal rows; back to 0 on another mail
+        self.preview_id = None      # the mail it was scrolled on
+        self.preview_rows = 10      # how tall it was last drawn (a page for space/b)
         self.searches = {}  # each list's filter (/), see search
         self.retop = False  # the search changed: select its first match
         self.keep = None   # Esc cleared the search: the zoomed entry to stay on
@@ -2851,6 +2855,8 @@ class Ui:
         self.move(delta)
 
     def switch(self, delta=1):
+        if self.zoom == "mail" and MAIL_VIEWER and delta > 0:
+            self.preview_focus = True  # into the preview (Tab/h/Esc: back to the list)
         if self.zoom:
             return
         if self.tasks:
@@ -2904,6 +2910,7 @@ class Ui:
         return action
 
     def toggle_zoom(self):
+        self.preview_focus = False
         if self.zoom:
             self.zoom = None
             return
@@ -2984,12 +2991,15 @@ class Ui:
                f"\033[{row + 1};{col + 1}H{CYAN}│{RESET} {fit(DIM + mb['from'] + RESET, inner_w)} {CYAN}│{RESET}"]
         for r in range(row + 2, row + box_h - 1):
             out.append(f"\033[{r};{col + 1}H{CYAN}│{RESET}{' ' * (box_w - 2)}{CYAN}│{RESET}")
-        kind, what = mail_view(mb["id"], mb["html"], mb["net"])
+        html = mail_html(mb["id"], mb["html"])
+        kind, what = mail_view(mb["id"], html, mb["net"])
         if kind == "busy" and mb["net"]:  # the plain rendering while the images load
             kind, what = mail_view(mb["id"], True)
         info = _mail_info.get(mb["id"]) or {}
+        if info and not mb.get("save") and (kind == "busy" or kind == "failed" and mb["html"] is None):
+            kind, what = "text", info["text"]  # its text while it renders (or if it can't); s waits for it
         if info.get("has_html") and RENDER_CMD:
-            keys = ("h text · " if mb["html"] or mb["net"] else "h rendered · ") + keys
+            keys = ("h text · " if html or mb["net"] else "h rendered · ") + keys
         if mb.get("save") and kind in ("text", "png", "failed") and not (mb["net"] and _preview["busy"]):
             # s asked for it; now it's there (with images: once they've loaded)
             mb["save"] = False
@@ -3175,14 +3185,26 @@ class Ui:
 
         preview = ""
         if self.zoom == "mail" and MAIL_VIEWER and body_height >= 12:
-            # The list on top, the selected mail's text below (Enter: rendered).
+            # The list on top, the selected mail below (Enter: in a box).
             list_height = body_height // 2
+            rows = body_height - list_height - 1
             body = self.column(2, width, list_height, True)
-            body.append(f"{DIM}{'─' * width}{RESET}")
-            body += [""] * (body_height - list_height - 1)
             mid = (self.action() or {}).get("message_id")
+            if mid != self.preview_id:
+                self.preview_id, self.preview_scroll = mid, 0
+            total = 0
             if mid:
-                preview = mail_text_preview(mid, len(header) + list_height + 2, body_height - list_height - 1, width)
+                preview, total = mail_preview(mid, len(header) + list_height + 2, rows, width, self.preview_scroll)
+            self.preview_rows = rows
+            self.preview_scroll = max(0, min(self.preview_scroll, total - rows))
+            if self.preview_focus:
+                pct = 100 if total <= rows else min(100, int(100 * (self.preview_scroll + rows) / total))
+                label = f" j/k ↑↓ space b scroll · Tab back to the list · {pct}% "
+                body.append(f"{CYAN}──{clip(label, width - 4)}" + "─" * max(0, width - 2 - len(label)) + RESET)
+            else:
+                label = " Tab: into the preview " if mid and total > rows else ""
+                body.append(f"{DIM}──{label}" + "─" * max(0, width - 2 - len(label)) + RESET)
+            body += [""] * rows
         elif self.zoom:
             body = self.column(2, width, body_height, True)
         elif self.tasks and two:
@@ -3246,7 +3268,15 @@ def viewer_module():
     return _viewer["m"]
 
 
-_mail_info = {}  # message id -> {"text": its text, "has_html": bool, "page": its HTML to render}
+_mail_info = {}  # message id -> {"text": its text, "has_html": bool, "designed": bool, "source", "cids"}
+
+
+def mail_html(message_id, asked=None):
+    """Whether to show the mail rendered: as asked (h), else when it's a
+    designed mail (lots of images or tables; see plain_enough)."""
+    if asked is not None:
+        return asked
+    return bool((_mail_info.get(message_id) or {}).get("designed")) and bool(RENDER_CMD)
 
 
 def mail_view(message_id, html=False, network=False):
@@ -3297,6 +3327,7 @@ def _mail_worker(message_id, path, render, network):
                 v.html_text(source).split()) / 2 else v.html_text(source))
             # cleaned: mail text must not reach the terminal with escape sequences
             info = {"text": cfg.clean(plain) or "(no text)", "has_html": bool(source),
+                    "designed": bool(source) and good is None,
                     "source": source or f"<pre>{_html.escape(text or '')}</pre>", "cids": cids}
             if len(_mail_info) > 200:
                 _mail_info.clear()
@@ -3389,13 +3420,22 @@ def place_png(png, top_row, left_col, rows, width, scroll=0):
             f"h={max(1, min(h - y, int(shown * per_row)))},c={cols},r={shown},C=1,q=2\033\\"), total
 
 
-def mail_text_preview(message_id, top_row, rows, width):
-    """The zoomed Mail section's bottom half: the selected mail's text."""
-    kind, what = mail_view(message_id)
+def mail_preview(message_id, top_row, rows, width, scroll=0):
+    """The zoomed Mail section's bottom half: the selected mail, rendered if
+    it's a designed mail, else its text; from scroll rows down. Returns
+    (escapes, rows the whole of it takes)."""
+    kind, what = mail_view(message_id, mail_html(message_id))
+    if kind == "png":
+        return place_png(what, top_row, 2, rows, width - 4, scroll)
+    info = _mail_info.get(message_id)
+    if kind in ("busy", "failed") and info:
+        kind, what = "text", info["text"]  # while it renders (or if it can't)
     if kind != "text":
-        return f"\033[{top_row};3H{DIM}{'no preview' if kind == 'failed' else 'loading…'}{RESET}"
-    lines = wrap_text(what, max(20, min(width - 4, 110)))[:rows]
-    return "".join(f"\033[{top_row + i};3H{clip(l, width - 4)}" for i, l in enumerate(lines))
+        return f"\033[{top_row};3H{DIM}{'no preview' if kind == 'failed' else 'loading…'}{RESET}", 0
+    lines = wrap_text(what, max(20, min(width - 4, 110)))
+    scroll = max(0, min(scroll, len(lines) - rows))
+    return "".join(f"\033[{top_row + i};3H{clip(l, width - 4)}"
+                   for i, l in enumerate(lines[scroll:scroll + rows])), len(lines)
 
 
 def view_mail(message_id):
@@ -3553,6 +3593,7 @@ Moving around
   Tab ←→ / h l    switch column
   v               system view (Now | Work) ⇄ task view
   z               zoom the section full screen (z/Esc/q goes back)
+                  zoomed Mail: Tab into the preview below (j/k space b scroll it, Tab back)
   1-9, 0          go to kitty tab 1–10 · g tab picker
   ?               this list · r refresh everything · q quit
 
@@ -3943,7 +3984,7 @@ def _process_key(ui, key, wakes):
         elif key == "i" and not mb["net"]:
             mb["net"], mb["scroll"] = True, 0
         elif key == "h":
-            mb["html"], mb["net"], mb["scroll"] = not (mb["html"] or mb["net"]), False, 0
+            mb["html"], mb["net"], mb["scroll"] = not (mail_html(mb["id"], mb["html"]) or mb["net"]), False, 0
         elif key == "o":
             info = _mail_info.get(mb["id"]) or {}
             if info.get("source"):
@@ -3954,7 +3995,7 @@ def _process_key(ui, key, wakes):
                 ui.say("opening it in the browser" if cfg.open_url("file://" + path) else "couldn't open the browser", 2)
         elif key == "s":  # saved as shown; a mail shown as text is rendered first, if it has HTML
             info = _mail_info.get(mb["id"]) or {}
-            if info.get("has_html") and RENDER_CMD and not (mb["html"] or mb["net"]):
+            if info.get("has_html") and RENDER_CMD and not (mail_html(mb["id"], mb["html"]) or mb["net"]):
                 mb["html"], mb["scroll"] = True, 0
             mb["save"] = True
             ui.say("saving…", 2)
@@ -3991,6 +4032,18 @@ def _process_key(ui, key, wakes):
             ui.popup = None
         return False
     key = key.lower() if key not in CASED_KEYS else key
+    if ui.zoom == "mail" and ui.preview_focus:  # in the preview: scroll it; Enter, d, o… still act on the mail
+        page = max(1, ui.preview_rows - 2)
+        steps = {"j": 3, "down": 3, "k": -3, "up": -3, " ": page, "pgdn": page, "b": -page, "pgup": -page}
+        if key in steps:
+            ui.preview_scroll = max(0, ui.preview_scroll + steps[key])
+            return False
+        if key == "g":
+            ui.preview_scroll = 0
+            return False
+        if key in ("\t", "backtab", "h", "left", "\033"):
+            ui.preview_focus = False
+            return False
     if (ui.zoom or ui.tasks) and key == "\033" and ui.search:
         ui.clear_search()
         return False
@@ -4110,7 +4163,7 @@ def handle(ui, key, wakes):
     elif key in ("\n", "\r") and MAIL_VIEWER and (ui.action() or {}).get("message_id"):
         action = ui.action()
         ui.mailbox = {"id": action["message_id"], "subject": action.get("subject", ""), "scroll": 0, "net": False,
-                      "html": False,  # its text first; h renders it (less untrusted HTML through a browser)
+                      "html": None,  # None: rendered if it's a designed mail, else its text; h switches
                       "from": (action.get("detail") or ("", ""))[0], "action": action}
     elif key in ("\n", "\r"):
         action = ui.action()
