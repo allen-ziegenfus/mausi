@@ -109,6 +109,31 @@ MAIL_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "mail")))         
 MAIL_OPEN_CMD = cfg.get("commands", "mail_open")                                  # "{id}" = the Message-ID
 MAIL_VIEWER = bool(MAIL_CMD and cfg.get("mail", "viewer"))                       # Enter: the mail box; d: delete
 RENDER_CMD = shlex.split(os.path.expanduser(cfg.get("mail", "render")))          # [] = mail as text only
+def mausi_version():
+    """What's running: "mausi <VERSION> (<commit>[+] <its date>)", "+" when
+    the checkout has changes not committed; without git just the version. Read
+    at start, so after a restart it's the new one."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    try:
+        with open(os.path.join(os.path.dirname(here), "VERSION")) as f:
+            semver = f.read().strip()
+    except OSError:
+        semver = ""
+    name = f"mausi {semver}".strip()
+    try:
+        r = subprocess.run(["git", "-C", here, "--no-optional-locks", "log", "-1", "--format=%h %cd",
+                            "--date=format:%Y-%m-%d %H:%M"], capture_output=True, text=True, timeout=5)
+        dirty = subprocess.run(["git", "-C", here, "--no-optional-locks", "status", "--porcelain", "--untracked-files=no"],
+                               capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return name if semver else ""
+    if r.returncode != 0 or not r.stdout.strip():
+        return name if semver else ""
+    commit, _, date = r.stdout.strip().partition(" ")
+    return f"{name} ({commit}{'+' if dirty else ''} {date})"
+
+
+VERSION = mausi_version()
 SAVE_DIR = os.path.expanduser(cfg.get("mail", "save_dir") or "~/Downloads")      # s in the mail box saves here
 PICKER = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "kitty", "picker.py")
 WORKTREE_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "worktree")))  # [] = no w key
@@ -3117,7 +3142,8 @@ class Ui:
                     " · c chat · t new task · a attach · o open mail · n note · b snippet · e edit · s shell · w worktree · r refresh")
         else:
             tabs = "  ".join(f"{BOLD}{CYAN}[{name}]{RESET}" if i == self.view else f"{DIM}{name}{RESET}"
-                             for i, name in enumerate(VIEWS)) + f"  {DIM}v tasks{RESET}"
+                             for i, name in enumerate(VIEWS)) + f"  {DIM}v tasks{RESET}" + (
+                                 f"  {DIM}· {VERSION}{RESET}" if VERSION else "")
             keys = "? keys · " + ("Tab/←→ column" if two else "Tab view") + (
                 " · ↑↓/jk move · Enter open/copy · z zoom · Space details · d done · u undo · p pin · +/- move"
                 " · L log energy · D dismiss all · c chat with Claude · t new task · a attach to a task · o open mail · n note · b snippet from clipboard · e edit · s shell · w worktree"
