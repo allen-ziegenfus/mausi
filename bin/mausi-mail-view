@@ -86,6 +86,9 @@ def header(msg, name):
     return clean(re.sub(r"\s+", " ", "".join(parts)).strip())
 
 
+MARKUP_RE = re.compile(r"(?i)<(?:/?(?:html|div|p|span|strong|em|code|pre|h[1-6]|ul|ol|li|table|tr|td|details|summary)|br\s*/?|a\s+href=)[\s>/=]")
+
+
 def body_parts(msg):
     """(html, text, {cid: data URI}) of the mail."""
     html_part = text_part = None
@@ -109,6 +112,8 @@ def body_parts(msg):
             html_part = content
         elif ctype == "text/plain" and text_part is None:
             text_part = content
+    if text_part and len(MARKUP_RE.findall(text_part)) >= 3:  # a text part that is HTML (e.g. a bot's comment)
+        text_part = html_text(text_part)
     return html_part, text_part, cids
 
 
@@ -394,8 +399,10 @@ def main():
             actions["open"] = open_in_browser
             if renderer:
                 actions["images"] = lambda: render(renderer, page_html(source, cids, network=True), workdir, network=True)
-            if not image:  # no browser to render with: the HTML as text
-                text = text or clean(html_text(source))
+            if not image:  # no browser to render with: the HTML as text, unless the text part says as much
+                html_words = clean(html_text(source))
+                if not text or len(text.split()) < len(html_words.split()) / 2:
+                    text = html_words
         with Screen() as scr:
             view(scr, msg, image, text or "(no text)", actions)
 

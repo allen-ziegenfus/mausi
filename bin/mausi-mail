@@ -37,6 +37,7 @@ removed), so --raw is instant for them.
 import argparse
 import datetime
 import hashlib
+import html
 import email
 import email.header
 import email.utils
@@ -119,8 +120,14 @@ def text(value):
 CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")  # what never leaves here: ESC and the like
 
 
+MARKUP_RE = re.compile(r"(?i)<(?:/?(?:html|div|p|span|strong|em|code|pre|h[1-6]|ul|ol|li|table|tr|td|details|summary)|br\s*/?|a\s+href=)[\s>/=]")
+
+
 def snippet(msg, limit=600):
-    """The start of the plain-text body (or the HTML with tags stripped)."""
+    """The start of the plain-text body, or of the HTML with tags stripped when
+    there's no text part or it has less than half the HTML's words
+    (notifications often put only the comment in it)."""
+    bodies = {}
     for want in ("text/plain", "text/html"):
         for part in msg.walk():
             if part.get_content_type() == want and not part.get_filename():
@@ -128,11 +135,14 @@ def snippet(msg, limit=600):
                     body = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", "replace")
                 except (AttributeError, LookupError):
                     continue
-                if want == "text/html":
-                    body = re.sub(r"(?is)<(script|style).*?</\1>|<[^>]+>", " ", body)
-                    body = re.sub(r"&nbsp;|&#160;", " ", body)
-                return CONTROLS.sub("", re.sub(r"\s+", " ", body).strip())[:limit]
-    return ""
+                if want == "text/html" or len(MARKUP_RE.findall(body)) >= 3:  # also a text part that is HTML
+                    body = re.sub(r"(?is)<(script|style|head)\b.*?</\1>|<[^>]+>", " ", body)
+                    body = html.unescape(body).replace("\xa0", " ")
+                bodies[want] = re.sub(r"\s+", " ", body).strip()
+                break
+    plain, stripped = bodies.get("text/plain", ""), bodies.get("text/html", "")
+    body = plain if plain and len(plain.split()) >= len(stripped.split()) / 2 else stripped
+    return CONTROLS.sub("", body)[:limit]
 
 
 def utf7_name(raw):
