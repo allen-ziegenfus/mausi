@@ -179,7 +179,8 @@ Each of these is off until you configure it:
   `--raw ID` and `--delete ID`, as `mausi-mail` does. With `[mail] render`, a
   command that turns an HTML file into a PNG (the contract is in
   `bin/mausi-mail-view`), `h` shows the mail rendered with kitty's graphics,
-  `i` with its remote images, and `f` full screen.
+  `i` with its remote images, and `f` full screen. `s` saves the mail as shown
+  (rendered as a PNG, else as text) to `[mail] save_dir` (default `~/Downloads`).
   In the zoomed Mail section, Enter after `/` searches every folder on the
   server (the mail command's `--search WORDS`).
 - **`[mail] sync`**: a command the collector runs every 5 minutes (and after

@@ -109,6 +109,7 @@ MAIL_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "mail")))         
 MAIL_OPEN_CMD = cfg.get("commands", "mail_open")                                  # "{id}" = the Message-ID
 MAIL_VIEWER = bool(MAIL_CMD and cfg.get("mail", "viewer"))                       # Enter: the mail box; d: delete
 RENDER_CMD = shlex.split(os.path.expanduser(cfg.get("mail", "render")))          # [] = mail as text only
+SAVE_DIR = os.path.expanduser(cfg.get("mail", "save_dir") or "~/Downloads")      # s in the mail box saves here
 PICKER = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "kitty", "picker.py")
 WORKTREE_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "worktree")))  # [] = no w key
 VIEWS = ("Now", "Work")
@@ -2952,7 +2953,7 @@ class Ui:
         row, col = 3, (width - box_w) // 2  # 1-based row of the top border, 0-based column
         inner_w, inner_h = box_w - 4, box_h - 4
         title = clip(f"{BOLD}{mb['subject']}{RESET}{CYAN}", box_w - 8)
-        keys = ("j/k ↑↓ space scroll · d delete · " + ("" if mb["net"] or not RENDER_CMD else "i images · ")
+        keys = ("j/k ↑↓ space scroll · d delete · s save · " + ("" if mb["net"] or not RENDER_CMD else "i images · ")
                 + "o browser · f full screen · q close")
         out = [f"\033[{row};{col + 1}H{CYAN}╭─ {title} " + "─" * max(0, box_w - 5 - visible_len(title)) + f"╮{RESET}",
                f"\033[{row + 1};{col + 1}H{CYAN}│{RESET} {fit(DIM + mb['from'] + RESET, inner_w)} {CYAN}│{RESET}"]
@@ -2964,6 +2965,10 @@ class Ui:
         info = _mail_info.get(mb["id"]) or {}
         if info.get("has_html") and RENDER_CMD:
             keys = ("h text · " if mb["html"] or mb["net"] else "h rendered · ") + keys
+        if mb.get("save") and kind in ("text", "png", "failed") and not (mb["net"] and _preview["busy"]):
+            # s asked for it; now it's there (with images: once they've loaded)
+            mb["save"] = False
+            self.say(save_mail(mb, kind, what), 4)
         seq = ""
         if kind == "text":
             lines = wrap_text(what, min(inner_w, 110))
@@ -3292,6 +3297,32 @@ def _mail_worker(message_id, path, render, network):
         _preview["failed"][key] = time.time()
     finally:
         _preview["busy"] = None
+
+
+def save_mail(mb, kind, what):
+    """Save the open mail to SAVE_DIR as shown (the rendering as PNG, a text-only
+    mail as .txt), named "YYYY-MM-DD From - Subject"."""
+    if kind == "failed":
+        return "couldn't render it, so nothing saved"
+    when = re.search(r"\d{4}-\d\d-\d\d", mb["from"])
+    sender = re.sub(r"\s*<[^>]*>|\s*·.*", "", mb["from"]).strip(' "')
+    name = f"{when.group(0) if when else time.strftime('%Y-%m-%d')} {sender[:40]} - {mb['subject'][:80]}"
+    name = re.sub(r"[/\\\x00-\x1f\x7f]+", "-", name.replace(":", "")).strip(" .-") or "mail"
+    ext = ".png" if kind == "png" else ".txt"
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    path, n = os.path.join(SAVE_DIR, name + ext), 1
+    while os.path.exists(path):  # never overwrite
+        n += 1
+        path = os.path.join(SAVE_DIR, f"{name} {n}{ext}")
+    try:
+        if kind == "png":
+            shutil.copyfile(what[0], path)
+        else:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"{mb['subject']}\n{mb['from']}\n\n{what}\n")
+    except OSError as e:
+        return f"couldn't save it: {e.strerror}"
+    return f"saved: {path.replace(os.path.expanduser('~'), '~', 1)}"
 
 
 def wrap_text(text, width):
@@ -3895,6 +3926,12 @@ def _process_key(ui, key, wakes):
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(v.page_html(info["source"], info["cids"], network=True))
                 ui.say("opening it in the browser" if cfg.open_url("file://" + path) else "couldn't open the browser", 2)
+        elif key == "s":  # saved as shown; a mail shown as text is rendered first, if it has HTML
+            info = _mail_info.get(mb["id"]) or {}
+            if info.get("has_html") and RENDER_CMD and not (mb["html"] or mb["net"]):
+                mb["html"], mb["scroll"] = True, 0
+            mb["save"] = True
+            ui.say("saving…", 2)
         elif key == "f":
             ui.mailbox = None
             ui.say(perform(mb["action"], "full") or "", 2)

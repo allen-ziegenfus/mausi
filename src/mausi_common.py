@@ -111,6 +111,7 @@ DEFAULTS = {
                                             # command must take --raw ID and --delete ID, as mausi-mail does)
         "render": "",                       # HTML to PNG, for the rendered view (h): <cmd> IN.html OUT.png
                                             # --width CSS_PX --max-pixels N [--network]; "" = text only
+        "save_dir": "~/Downloads",          # s in the mail box saves the mail here (rendered: PNG)
     },
     "commands": {
         "calendar": "",                     # prints today's meetings as JSON (optional arg: YYYY-MM-DD)
