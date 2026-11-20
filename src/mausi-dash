@@ -2165,11 +2165,12 @@ def needs_lines(detail=False, width=None):
     t = entry["data"]
     stamp = time.strftime("%H:%M", time.localtime(t.get("at", 0)))
     error = f" {RED}{t['error'][:60]}{RESET}" if t.get("error") else ""
-    lines = [(f"{head} {DIM}(Claude at {stamp} · i asks again){RESET}{error}", None)]
-    # Marked done since this run: hidden. A later run was told about them, so
-    # an item it lists again has news.
+    lines = [(f"{head} {DIM}(Claude at {stamp} · d when handled · i asks again){RESET}{error}", None)]
+    # The list keeps items until d marks them done. Marked done since an item
+    # was last listed: hidden. A later run was told about it, so an item it
+    # lists again has news.
     done = {d["key"]: d["at"] for d in context.triage_done()}
-    items = [i for i in t.get("items") or [] if done.get(context.triage_key(i), 0) < t.get("at", 0)]
+    items = [i for i in t.get("items") or [] if done.get(context.triage_key(i), 0) < i.get("seen", t.get("at", 0))]
     hidden = len(t.get("items") or []) - len(items)
     if hidden:
         lines[0] = (lines[0][0] + f" {DIM}· {hidden} done{RESET}", None)
@@ -2188,7 +2189,10 @@ def needs_lines(detail=False, width=None):
         if key:
             action["ticket"] = key.group(0)
         action["triage_item"] = item
-        lines.append((f"  {color}{mark}{RESET} {item['title']}  {DIM}{item.get('why', '')}{RESET}", action))
+        # From an earlier run: when it first came up.
+        first = item.get("first", t.get("at", 0))
+        since = f"  {DIM}· since {time.strftime('%a %H:%M', time.localtime(first))}{RESET}" if first < t.get("at", 0) else ""
+        lines.append((f"  {color}{mark}{RESET} {item['title']}  {DIM}{item.get('why', '')}{RESET}{since}", action))
         if detail and ref:
             lines.append((f"      {DIM}{item.get('source')} · {ref}{RESET}", None))
     if not items:
