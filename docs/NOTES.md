@@ -8,7 +8,7 @@ the traps found so far. The README covers installing and using it.
 | Where | What |
 |---|---|
 | `~/.config/mausi/config.toml` | the config; every key is optional (`config.example.toml`) |
-| `~/tasks/<PREFIX>-<n>/TASK.md` | one task: YAML header (id, title, summary, section, order, status, added, done, keywords, watch, repos, effort) and `- ` notes. The task store is a git repo; each change is a commit |
+| `~/tasks/<PREFIX>-<n>/TASK.md` | one task: YAML header (id, title, summary, section, order, status, added, done, keywords, watch, due, repos, effort) and `- ` notes. The task store is a git repo; each change is a commit |
 | `~/tasks/<id>/code/` | links to the task's worktrees and `repos:`, kept up to date by the dashboard every minute (git ignores it) |
 | `~/tasks/by-name/` | readable links to the task folders |
 | `~/.claude/tasks.md` | generated overview for Claude; never edited by hand |

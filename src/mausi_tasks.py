@@ -17,6 +17,7 @@ TASK.md is a YAML header and the task's notes:
     pinned_from: null       # the section it came from while pinned to Now
     keywords: [cx, scaling] # optional: search words not in the text (tasks tag / tasks find)
     watch: [PROJ-123]       # optional: tickets/PRs the task waits on, checked at session start (tasks watch)
+    due: 2026-11-23 run ./check.sh  # optional: a date and what to do then; triage lists it from that day on (tasks due)
     repos: [~/src/foo]      # optional: other folders (repos) that belong to the task, linked into code/
     extra_hours: 1.5        # optional: time spent outside Claude (tasks spent)
     effort: {...}           # optional: the effort, frozen when the task is done
@@ -76,7 +77,7 @@ def task_path(tid):
 
 BROKEN = {}  # task id -> why its TASK.md couldn't be read (load() skips it); `tasks` reports them
 HEADER_RE = re.compile(r"\A\ufeff?---[ \t]*\n(.*?)^---[ \t]*$\n?(.*)", re.S | re.M)
-TEXT_FIELDS = ("id", "title", "summary", "section", "status", "pinned_from")
+TEXT_FIELDS = ("id", "title", "summary", "section", "status", "pinned_from", "due")
 
 
 def load(tid):
@@ -250,7 +251,7 @@ def nudge(t, step):
 def _text(t):
     header = {k: t.get(k) for k in ("id", "title", "summary", "section", "order", "status", "added", "done",
                                      "pinned_from")}
-    header.update({k: t[k] for k in ("keywords", "watch", "repos", "extra_hours", "effort") if t.get(k)})
+    header.update({k: t[k] for k in ("keywords", "watch", "due", "repos", "extra_hours", "effort") if t.get(k)})
     body = "\n".join(t.get("notes", [])).rstrip("\n")
     return "---\n" + yaml.safe_dump(header, sort_keys=False, allow_unicode=True, width=1000) + "---\n" + \
         (body + "\n" if body else "")
@@ -272,6 +273,33 @@ def set_watch(t, refs, remove=False):
     t["watch"] = [r for r in current if r not in refs] if remove else current + [r for r in refs if r not in current]
     save(t, f"{t['id']}: watch {' '.join(t['watch']) or '(none)'}")
     return t["watch"]
+
+
+DUE_RE = re.compile(r"\s*(\d{4}-\d{2}-\d{2})\b\s*(.*)", re.S)
+
+
+def set_due(t, date=None, what=""):
+    """Set the task's due date (YYYY-MM-DD) and what to do then; no date clears it."""
+    if date:
+        datetime.date.fromisoformat(date)  # ValueError on a bad date
+        t["due"] = f"{date} {' '.join(what.split())}".strip()
+    else:
+        t.pop("due", None)
+    save(t, f"{t['id']}: due {t.get('due') or '(none)'}")
+    return t.get("due")
+
+
+def parse_due(t):
+    """(date, what) from the task's due field, or None when it has none or it doesn't start with a date."""
+    m = DUE_RE.fullmatch(str(t.get("due") or ""))
+    return (m.group(1), " ".join(m.group(2).split())) if m else None
+
+
+def due_tasks(today=None):
+    """Open tasks due on or before today: [(date, what, task)], oldest first."""
+    today = today or time.strftime("%Y-%m-%d")
+    out = [(d[0], d[1], t) for t in load_all() if t.get("status") == "open" and (d := parse_due(t)) and d[0] <= today]
+    return sorted(out, key=lambda x: (x[0], x[2]["id"]))
 
 
 SEARCH_SKIP = {"scratch", "code"}  # git-ignored scratch files, links to worktrees

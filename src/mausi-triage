@@ -114,6 +114,17 @@ def digest(doc):
         out.append("## Pinned Now tasks")
         out += [f"- {clip(t, 200)}" for t in now_tasks]
 
+    try:
+        import mausi_tasks  # the task store, when this machine has one
+        due = mausi_tasks.due_tasks()
+    except Exception as e:  # e.g. no pyyaml for this python: say so, triage still runs
+        print(f"mausi-triage: due tasks left out: {e}", file=sys.stderr)
+        due = []
+    if due:
+        out.append(f"## Tasks due or overdue (today is {time.strftime('%Y-%m-%d')})")
+        out += [f"- {d} {t['id']} {clip(t.get('title'), 120)} — to do: {clip(what, 200) or '(see the task)'}"
+                for d, what, t in due]
+
     board = data("board") or {}
     prs = [("mine", p) for p in board.get("mine") or []] + [("involved", p) for p in board.get("involved") or []]
     if prs:

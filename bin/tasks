@@ -14,6 +14,7 @@
     tasks find scaling cx [-o]     # tasks matching all words: keywords, title, notes, files (-o: open only)
     tasks tag T-12 cx scaling [-r]   # add (-r: remove) search keywords; no words: show them
     tasks watch [T-12 PROJ-123 [-r]]   # what a task waits on (-r: remove); no task: all watched open tasks
+    tasks due [T-12 [2026-11-23 what to do] [-r]]   # a date triage reminds from (-r: clear); no task: all dated open tasks
     tasks sync                     # regenerate the overview after editing TASK.md files
     tasks effort [T-12]           # time spent (from my messages in its Claude sessions) and timespan
     tasks spent T-12 1.5 [note]   # add time spent outside Claude, in hours
@@ -178,6 +179,11 @@ def main():
     watch.add_argument("task", nargs="?")
     watch.add_argument("refs", nargs="*")
     watch.add_argument("-r", "--remove", action="store_true")
+    due = sub.add_parser("due")
+    due.add_argument("task", nargs="?")
+    due.add_argument("date", nargs="?")
+    due.add_argument("what", nargs="*")
+    due.add_argument("-r", "--remove", action="store_true")
     effort = sub.add_parser("effort")
     effort.add_argument("task", nargs="?")
     effort.add_argument("-a", "--all", action="store_true", help="done tasks too")
@@ -228,6 +234,19 @@ def main():
             for t in store.load_all():
                 if t.get("status") == "open" and t.get("watch"):
                     print(f"{t['id']}\t{' '.join(t['watch'])}\t{t['title']}")
+    elif args.cmd == "due":
+        if args.task:
+            t = need(args.task)
+            if args.remove or args.date:
+                try:
+                    store.set_due(t, None if args.remove else args.date, " ".join(args.what))
+                except ValueError:
+                    sys.exit(f"not a date (YYYY-MM-DD): {args.date}")
+            print(f"{t['id']}: {t.get('due') or '(no due date)'}")
+        else:
+            for t in store.load_all():
+                if t.get("status") == "open" and t.get("due"):
+                    print(f"{t['id']}\t{t['due']}\t{t['title']}")
     elif args.cmd == "sync":
         print("regenerated" if store.sync() else "already up to date")
     elif args.cmd == "effort":
