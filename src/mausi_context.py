@@ -459,6 +459,22 @@ def fetch_triage(hard=False):
     return (last or None), (last or {}).get("error")
 
 
+STANDUP = os.path.join(cfg.CACHE_DIR, "standup.json")
+
+
+def fetch_standup(hard=False):
+    """Today's standup drafts from mausi-standup: {drafts: {name: {board,
+    meeting, start, yesterday, today, blockers, nudge, text, error}}}. Runs it
+    every time: it only calls Claude when a standup is due and not drafted."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    run([os.path.join(here, "mausi-standup"), "--quiet"], 300)
+    try:
+        with open(STANDUP) as f:
+            return json.load(f), None
+    except (OSError, ValueError):
+        return {"drafts": {}}, None
+
+
 def notifications_changed():
     """A stamp that changes when the notification log or the dismissed list
     does, so the notifications source can be re-read only then."""
@@ -484,6 +500,7 @@ SOURCES = {
     "infra": (fetch_infra, 15, True),
     "sessions": (fetch_sessions, 15, True),
     "triage": (fetch_triage, 60, bool(cfg.get("triage", "enabled"))),
+    "standup": (fetch_standup, 60, bool(cfg.get("standup", "enabled")) and cfg.BOARD),
 }
 
 

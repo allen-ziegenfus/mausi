@@ -93,6 +93,13 @@ DEFAULTS = {
     "jira": {
         "site": "",                         # e.g. https://example.atlassian.net
     },
+    "standup": {
+        "enabled": False,                   # draft a statement before each standup a board names (needs the
+                                            # board's "boards" with "standup", and the calendar); sends Claude the
+                                            # board's digest, task notes and PRs
+        "lead_minutes": 30,                 # how long before the meeting
+        "model": "sonnet",
+    },
     "triage": {
         "enabled": False,                   # every 30 min (when something new came in) and on i: Claude reads
                                             # the context and lists what needs you; sends mail and Slack to Claude

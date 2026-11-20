@@ -154,6 +154,14 @@ Each of these is off until you configure it:
   `bin/mausi-todos FILE...` shows TODO files the same way: each file's open
   items under their headings (Enter opens the file at the item). `command` can
   be a list; the commands' output is merged.
+- **`[standup]`**: a board in the board's `boards` may name its standup
+  meeting (`"standup"`: part of the meeting's title), with `"digest"` lines
+  about itself and `"refs"` (its ticket keys). With `enabled = true`,
+  `lead_minutes` before that meeting `mausi-standup` has Claude draft what to
+  say (done / next / blocked) from the board, the task notes since the last
+  standup and your PRs, or a plain "you have no update" when there's nothing;
+  it shows as Standup in Now (Enter copies). `mausi-standup --board NAME`
+  drafts one now.
 - **`[projects]`**: folders you work on often, in named groups
   (`personal = ["~/src/app", "~/src/tools-*", "~/src/{a,b}"]`). Adds the Projects
   section to Now: each folder's git state (branch, uncommitted changes, last

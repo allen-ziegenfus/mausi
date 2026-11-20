@@ -74,6 +74,10 @@ to prepare for, a pinned task with a deadline, an overdue or due-today to-do
 that matters (not a shopping or reading list). Leave out newsletters, bots,
 automated digests, announcements, FYIs, things already handled (the last
 comment is theirs and nobody replied) and anything merely interesting.
+Team board parts (Jira sprints and support queues) count too: a new or
+unassigned ticket on a queue the team answers, someone else's comment or
+question on their ticket, and their sprint ticket with no status change for
+days (worth a word at standup) are worth an item.
 Order by urgency: "now" (someone waits right now, or within the hour),
 "today", "soon". Merge items about the same thing. Use only facts from the
 digest; take URLs only from it. If nothing needs them, return no items.

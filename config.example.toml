@@ -57,6 +57,12 @@ enabled = false                  # "Needs you": every 30 min (when something new
                                  # reads the context and lists what needs you. Sends mail and Slack text to Claude.
 model = "sonnet"
 
+[standup]
+enabled = false                  # before each standup a board names ("standup" in the board's "boards"), claude -p
+                                 # drafts what to say from the board, task notes and PRs, or tells you there's no update
+lead_minutes = 30
+model = "sonnet"
+
 [review]
 forward_owner = ""               # GitHub owner of the repo PRs get forwarded to for a final review
 forward_name = ""                # who that is ("waiting on <name>", the stage label)

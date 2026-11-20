@@ -2190,6 +2190,32 @@ def needs_lines(detail=False, width=None):
     return lines
 
 
+def standup_lines(detail=False, width=None):
+    """Standup: the statements mausi-standup drafted for today's standups;
+    Enter copies one."""
+    entry = ctx.get("standup") if ctx else None
+    drafts = list(((entry or {}).get("data") or {}).get("drafts", {}).values())
+    lead = cfg.get("standup", "lead_minutes")
+    if not drafts:
+        return [(f"{BOLD}Standup{RESET} {DIM}(drafted {lead} min before each standup · mausi-standup --board NAME now){RESET}", None)]
+    lines = [(f"{BOLD}Standup{RESET} {DIM}(Enter copies){RESET}", None)]
+    for d in sorted(drafts, key=lambda d: d.get("start") or ""):
+        stamp = time.strftime("%H:%M", time.localtime(d.get("at", 0)))
+        head = f"  {CYAN}{d.get('board')}{RESET} {DIM}{str(d.get('start') or '')[11:16]} · drafted {stamp}{RESET}"
+        action = {"copy": d.get("text", ""), "copy_name": "standup", "detail": (d.get("board"), d.get("text", ""))}
+        lines.append((head, action))
+        if d.get("error"):
+            lines.append((f"    {RED}{d['error'][:100]}{RESET}", action))
+            continue
+        if d.get("nudge"):
+            lines += [(f"    {YELLOW}{l}{RESET}", action) for l in textwrap.wrap("⚠ " + d["nudge"], max(30, (width or 100) - 6))]
+        for key in ("yesterday", "today", "blockers"):
+            for x in d.get(key) or []:
+                label = {"yesterday": "done", "today": "next", "blockers": "blocked"}[key]
+                lines.append((f"    {DIM}{label:<7}{RESET} {x}", action))
+    return lines
+
+
 def meeting_lines(detail=False):
     with lock:
         data, later = meetings, meetings_tomorrow
@@ -2637,6 +2663,8 @@ def _section_lines(name, rows, detail=False, width=None, history=False):
         return meeting_lines(detail)
     if name == "needs":
         return needs_lines(detail, width)
+    if name == "standup":
+        return standup_lines(detail, width)
     if name == "sessions":
         return session_lines(rows, detail)
     if name == "notifications":
@@ -2676,7 +2704,7 @@ def _section_lines(name, rows, detail=False, width=None, history=False):
     return []
 
 
-VIEW_SECTIONS = {"Now": ("you", "today", "needs", "reminders", "sessions", "projects", "pinned", "tasks", "docker", "kube"),
+VIEW_SECTIONS = {"Now": ("you", "today", "standup", "needs", "reminders", "sessions", "projects", "pinned", "tasks", "docker", "kube"),
                  "Work": ("slack", "notifications", "mail", "notes", "prs", "boards", "jira", "jira_created", "recent")}
 # Sections whose source isn't set up are left out: the board (PRs, Jira), the
 # calendar and mail commands, and the notification log (Linux capture).
@@ -2684,11 +2712,12 @@ _SOURCE = {"today": bool(cfg.get("commands", "calendar")), "mail": bool(cfg.get(
            "reminders": bool(REMINDERS_CMD), "projects": bool(cfg.config().get("projects")),
            "prs": cfg.BOARD, "boards": cfg.BOARD, "jira": cfg.BOARD, "jira_created": cfg.BOARD, "recent": cfg.BOARD,
            "needs": bool(cfg.get("triage", "enabled")),
+           "standup": bool(cfg.get("standup", "enabled")) and cfg.BOARD,
            "slack": os.path.exists(NOTIFICATIONS) or bool(cfg.get("notifications", "capture")),
            "notifications": os.path.exists(NOTIFICATIONS) or bool(cfg.get("notifications", "capture")),
            "docker": bool(shutil.which("docker")), "kube": bool(shutil.which("kubectl") or shutil.which("k3d"))}
 VIEW_SECTIONS = {view: tuple(n for n in names if _SOURCE.get(n, True)) for view, names in VIEW_SECTIONS.items()}
-SECTION_TITLES = {"you": "You", "today": "Today", "needs": "Needs you", "reminders": "Reminders", "projects": "Projects", "sessions": "Sessions", "docker": "Docker", "kube": "Kubernetes",
+SECTION_TITLES = {"you": "You", "today": "Today", "standup": "Standup", "needs": "Needs you", "reminders": "Reminders", "projects": "Projects", "sessions": "Sessions", "docker": "Docker", "kube": "Kubernetes",
                   "notifications": "Notifications", "slack": "Slack", "mail": "Mail", "notes": "Notes", "prs": "PRs", "boards": "Boards", "jira": "Jira: assigned to me", "jira_created": "Jira: created by me", "recent": "Recently closed", "tasks": "Tasks",
                   "pinned": "Now (pinned tasks)"}
 
