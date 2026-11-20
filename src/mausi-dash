@@ -2201,28 +2201,63 @@ def needs_lines(detail=False, width=None):
 
 
 def standup_lines(detail=False, width=None):
-    """Standup: the statements mausi-standup drafted for today's standups;
-    Enter copies one."""
+    """Standup: per board that names a standup, the statement mausi-standup
+    drafted for the last (or upcoming) one, Enter copies it; under it what
+    piled up since the last standup (tasks with new notes, closed PRs)."""
     entry = ctx.get("standup") if ctx else None
-    drafts = list(((entry or {}).get("data") or {}).get("drafts", {}).values())
+    data = (entry or {}).get("data") or {}
+    drafts, done = data.get("drafts") or {}, data.get("progress") or {}
     lead = cfg.get("standup", "lead_minutes")
-    if not drafts:
+    if not drafts and not done:
         return [(f"{BOLD}Standup{RESET} {DIM}(drafted {lead} min before each standup · mausi-standup --board NAME now){RESET}", None)]
-    lines = [(f"{BOLD}Standup{RESET} {DIM}(Enter copies){RESET}", None)]
-    for d in sorted(drafts, key=lambda d: d.get("start") or ""):
-        stamp = time.strftime("%H:%M", time.localtime(d.get("at", 0)))
-        head = f"  {CYAN}{d.get('board')}{RESET} {DIM}{str(d.get('start') or '')[11:16]} · drafted {stamp}{RESET}"
-        action = {"copy": d.get("text", ""), "copy_name": "standup", "detail": (d.get("board"), d.get("text", ""))}
-        lines.append((head, action))
-        if d.get("error"):
-            lines.append((f"    {RED}{d['error'][:100]}{RESET}", action))
+    lines = [(f"{BOLD}Standup{RESET} {DIM}(Enter copies the draft · drafted {lead} min before){RESET}", None)]
+    wrap = max(30, (width or 100) - 6)
+    today = time.strftime("%Y-%m-%d")
+
+    def order(name):
+        return str((drafts.get(name) or {}).get("start") or "") or name
+    for name in sorted(set(drafts) | set(done), key=order):
+        d, p = drafts.get(name), done.get(name) or {}
+        board = (d or p).get("board") or name
+        if d:
+            at = d.get("at", 0)
+            stamp = time.strftime("%H:%M" if d.get("day") == today else "%a %H:%M", time.localtime(at))
+            head = f"  {CYAN}{board}{RESET} {DIM}{str(d.get('start') or '')[11:16]} · drafted {stamp}{RESET}"
+            action = {"copy": d.get("text", ""), "copy_name": "standup", "detail": (board, d.get("text", ""))}
+            lines.append((head, action))
+            if d.get("error"):
+                lines.append((f"    {RED}{d['error'][:100]}{RESET}", action))
+            else:
+                if d.get("nudge"):
+                    lines += [(f"    {YELLOW}{l}{RESET}", action) for l in textwrap.wrap("⚠ " + d["nudge"], wrap)]
+                for key in ("yesterday", "today", "blockers"):
+                    for x in d.get(key) or []:
+                        label = {"yesterday": "done", "today": "next", "blockers": "blocked"}[key]
+                        lines.append((f"    {DIM}{label:<7}{RESET} {x}", action))
+        else:
+            lines.append((f"  {CYAN}{board}{RESET} {DIM}no draft yet{RESET}", None))
+        if not p:
             continue
-        if d.get("nudge"):
-            lines += [(f"    {YELLOW}{l}{RESET}", action) for l in textwrap.wrap("⚠ " + d["nudge"], max(30, (width or 100) - 6))]
-        for key in ("yesterday", "today", "blockers"):
-            for x in d.get(key) or []:
-                label = {"yesterday": "done", "today": "next", "blockers": "blocked"}[key]
-                lines.append((f"    {DIM}{label:<7}{RESET} {x}", action))
+        since = time.strftime("%a %H:%M", time.localtime(p.get("since", 0)))
+        rows = []
+        for t in p.get("tasks") or []:
+            keys = f" {DIM}{', '.join(t['keys'])}{RESET}" if t.get("keys") else ""
+            note = f"  {DIM}{t.get('last', '')}{RESET}" if detail else ""
+            rows.append((f"    {GREEN}+{t['notes']}{RESET} {t['id']} {t['title'][:70]}{keys}{note}",
+                         {"task": t["title"], "task_ref": t["id"], "detail": (f"{t['id']} {t['title']}", t.get("last", ""))}))
+        for pr in p.get("prs") or []:
+            rows.append((f"    {GREEN}{pr['how']}{RESET} {pr.get('ref')} {DIM}{(pr.get('title') or '')[:70]}{RESET}",
+                         {"open": pr.get("url"), "pr": pr.get("ref"), "detail": (pr.get("ref"), pr.get("title") or "")}))
+        other = p.get("other") or []
+        def n(k, word):
+            return f"{k} {word}" + ("" if k == 1 else "s")
+        lines.append((f"    {DIM}since the last standup ({since}): {n(len(p.get('tasks') or []), 'task')}, "
+                      f"{n(len(p.get('prs') or []), 'PR')} closed" + (f"; other work: {n(len(other), 'task')}" if other else "")
+                      + (f", {n(p['other_prs'], 'PR')}" if p.get("other_prs") else "") + f"{RESET}", None))
+        limit = None if detail else 6
+        lines += rows[:limit]
+        if limit and len(rows) > limit:
+            lines.append((f"    {DIM}+{len(rows) - limit} more (zoom){RESET}", None))
     return lines
 
 

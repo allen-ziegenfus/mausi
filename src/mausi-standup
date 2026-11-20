@@ -15,7 +15,12 @@ gathers what I did since the last one:
 and runs one `claude -p` (no tools, like mausi-triage) that answers with
 yesterday / today / blockers, or, when there is nothing to say, a nudge that
 says so. The answer goes to ~/.cache/mausi/standup.json (0600), which the
-collector puts in the context and the dashboard shows as "Standup".
+collector puts in the context and the dashboard shows as "Standup". A draft
+stays until the board's next one replaces it.
+
+Every run also writes, per board, the progress since its last standup (no
+Claude): tasks with notes since then and PRs closed since then, so the
+dashboard shows what piles up between one standup and the next.
 
     mausi-standup                  # draft the standups that are due and not drafted yet
     mausi-standup --board NAME     # draft this board's standup now (part of its title)
@@ -143,16 +148,12 @@ def clip(text, n=400):
     return text if len(text) <= n else text[:n - 1] + "…"
 
 
-def digest(doc, board, start):
-    since = since_last(start)
+def worked_on(board, since, notes=None):
+    """([(task, keys, notes)] on this board's work, [...] other work): the
+    tasks with notes added since then."""
+    notes = task_notes(since) if notes is None else notes
     refs = set(board.get("refs") or []) | {i.get("ref") for i in board.get("items") or []}
-    out = [f"Standup for board {board['title']} at {time.strftime('%a %H:%M', time.localtime(start))}; "
-           f"the last one was {time.strftime('%a %Y-%m-%d %H:%M', time.localtime(since))}."]
-    out.append("## The board")
-    out += [f"- {clip(line)}" for line in (board.get("digest") or [])[:40]]
-
-    notes = task_notes(since)
-    by_id = {t["id"]: t for t in tasks.load_all()}
+    by_id = {t["id"]: t for t in tasks.load_all()} if notes else {}
     ours, other = [], []
     for tid, lines in sorted(notes.items()):
         t = by_id.get(tid)
@@ -160,9 +161,62 @@ def digest(doc, board, start):
             continue
         keys = tasks.task_tickets(t)
         on_board = bool(refs & set(keys)) or any(refs & set(tasks.KEY_RE.findall(n)) for n in lines)
-        part = ours if on_board else other
-        part.append(f"### {tid} {clip(t.get('title'), 120)}" + (f" ({', '.join(keys)})" if keys else ""))
-        part += [f"- {clip(n, 600)}" for n in lines[-8:]]
+        (ours if on_board else other).append((t, keys, lines))
+    return ours, other
+
+
+def closed_prs(doc, since):
+    """My PRs closed (merged, forwarded or not) since then."""
+    data = (doc.get("sources", {}).get("board") or {}).get("data") or {}
+    out = []
+    for p in (data.get("recent") or {}).get("prs") or []:
+        try:
+            at = time.mktime(time.strptime(str(p.get("closed"))[:16], "%Y-%m-%d %H:%M"))
+        except ValueError:
+            continue
+        if at >= since:
+            out.append(p)
+    return out
+
+
+def last_standup(drafts, key, ev, now):
+    """When this board's last standup was: today's meeting once it started
+    and was drafted, else the previous workday at the meeting's time."""
+    d = drafts.get(key) or {}
+    start = parse_time(d.get("start"))
+    if start and start <= now:
+        return start
+    upcoming = parse_time(ev["start"]) if ev else None
+    return since_last(upcoming if upcoming and upcoming > now else now)
+
+
+def progress(doc, board, since, notes):
+    """What piled up since the last standup, for the dashboard."""
+    ours, other = worked_on(board, since, notes)
+    refs = set(board.get("refs") or []) | {i.get("ref") for i in board.get("items") or []}
+    prs = closed_prs(doc, since)
+    on_board = [p for p in prs if refs & set(tasks.KEY_RE.findall(p.get("title") or ""))]
+    return {"since": since, "other_prs": len(prs) - len(on_board),
+            "tasks": [{"id": t["id"], "title": t.get("title", ""), "keys": keys, "notes": len(lines),
+                       "last": clip(lines[-1], 300)} for t, keys, lines in ours],
+            "other": [{"id": t["id"], "title": t.get("title", ""), "notes": len(lines)} for t, keys, lines in other],
+            "prs": [{"ref": p.get("ref"), "title": p.get("title"), "url": p.get("url"), "closed": p.get("closed"),
+                     "how": "merged" if p.get("merged") else "forwarded" if p.get("forwarded") else "closed"}
+                    for p in on_board]}
+
+
+def digest(doc, board, start):
+    since = since_last(start)
+    out = [f"Standup for board {board['title']} at {time.strftime('%a %H:%M', time.localtime(start))}; "
+           f"the last one was {time.strftime('%a %Y-%m-%d %H:%M', time.localtime(since))}."]
+    out.append("## The board")
+    out += [f"- {clip(line)}" for line in (board.get("digest") or [])[:40]]
+
+    ours, other = [], []
+    for part, found in zip((ours, other), worked_on(board, since)):
+        for t, keys, lines in found:
+            part.append(f"### {t['id']} {clip(t.get('title'), 120)}" + (f" ({', '.join(keys)})" if keys else ""))
+            part += [f"- {clip(n, 600)}" for n in lines[-8:]]
     if ours:
         out.append("## Their task notes since the last standup, on this board's work")
         out += ours
@@ -269,21 +323,30 @@ def main(args):
             print(digest(doc, b, parse_time(ev["start"]) if ev else time.time()), end="\n\n")
         return 0
     today = time.strftime("%Y-%m-%d")
-    drafts = {k: v for k, v in state.get("drafts", {}).items() if v.get("day") == today}
+    # A draft stays until the board's next standup replaces it; boards that
+    # no longer name a standup drop out.
+    names = {b["standup"] for b, ev in standups(doc)}
+    drafts = {k: v for k, v in state.get("drafts", {}).items() if k in names}
     now = time.time()
-    changed = False
     for b, ev in found:
         key = b["standup"]
         if not want:  # on its own: only a meeting starting within lead_minutes, once a day
             start = parse_time(ev["start"]) if ev else None
-            if start is None or not (start - lead() <= now <= start + 600) or key in drafts:
+            if start is None or not (start - lead() <= now <= start + 600) or drafts.get(key, {}).get("day") == today:
                 continue
         drafts[key] = draft(doc, b, ev)
-        changed = True
         if "--quiet" not in args:
             print(f"## {b['title']}\n{drafts[key]['text']}\n")
-    if changed or len(drafts) != len(state.get("drafts", {})):
-        save({"drafts": drafts})
+    done = {}
+    notes_since = {}
+    for b, ev in standups(doc):
+        since = last_standup(drafts, b["standup"], ev, now)
+        if since not in notes_since:
+            notes_since[since] = task_notes(since)
+        done[b["standup"]] = {"board": b["title"], **progress(doc, b, since, notes_since[since])}
+    new_state = {"drafts": drafts, "progress": done}
+    if new_state != state:
+        save(new_state)
     return 0
 
 

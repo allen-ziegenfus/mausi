@@ -463,9 +463,11 @@ STANDUP = os.path.join(cfg.CACHE_DIR, "standup.json")
 
 
 def fetch_standup(hard=False):
-    """Today's standup drafts from mausi-standup: {drafts: {name: {board,
-    meeting, start, yesterday, today, blockers, nudge, text, error}}}. Runs it
-    every time: it only calls Claude when a standup is due and not drafted."""
+    """Standup drafts and progress from mausi-standup: {drafts: {name: {board,
+    meeting, start, day, yesterday, today, blockers, nudge, text, error}},
+    progress: {name: {board, since, tasks, other, prs}}}. A draft stays until
+    the next one. Runs it every time: it only calls Claude when a standup is
+    due and not drafted today."""
     here = os.path.dirname(os.path.realpath(__file__))
     run([os.path.join(here, "mausi-standup"), "--quiet"], 300)
     try:
