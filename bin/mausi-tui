@@ -284,6 +284,9 @@ class Dashboard(App):
         if dash.process_key(self.ui, key, self.wakes):
             self.exit()
             return
+        if self.ui.mailbox:  # no mail box here (kitty images over Textual): the full-screen viewer instead
+            action, self.ui.mailbox = self.ui.mailbox["action"], None
+            self.ui.say(dash.perform(action, "full") or "", 2)
         self.redraw()
 
     def on_key(self, event: events.Key):
