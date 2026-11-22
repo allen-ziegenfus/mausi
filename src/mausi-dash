@@ -3544,6 +3544,39 @@ def mail_folder_args(message_id):
     return []
 
 
+def mail_is_list(message_id):
+    """Whether the listed mail has a List-Id or List-Unsubscribe (mausi-mail's "list")."""
+    with lock:
+        listed = list((mail or {}).get("messages") or [])
+    listed += (mail_search or {}).get("messages") or []
+    return any(m.get("message_id") == message_id and m.get("list") for m in listed)
+
+
+def unsubscribe_offer(message_id):
+    """The mail's web List-Unsubscribe link (mausi-mail-view's unsubscribe_offer), or None."""
+    import email.parser
+    import email.policy
+    r = subprocess.run(MAIL_CMD + [f"--raw={message_id}"] + mail_folder_args(message_id),
+                       capture_output=True, timeout=30)
+    if r.returncode != 0 or not r.stdout:
+        return None
+    head = email.parser.BytesHeaderParser(policy=email.policy.compat32).parsebytes(r.stdout)
+    return viewer_module().unsubscribe_offer(head)
+
+
+def unsubscribe_in_background(ui, wakes, offer):
+    """One click when the mail offers it, else its page in the browser."""
+    def run():
+        try:
+            said = viewer_module().unsubscribe(offer, cfg.open_url)
+        except Exception as e:  # noqa: BLE001 - say it rather than lose it with the thread
+            said = f"couldn't unsubscribe: {type(e).__name__}: {str(e)[:60]}"
+        ui.say(said, 4)
+        wakes[1].set()
+    threading.Thread(target=run, daemon=True).start()
+    return f"unsubscribing from {offer['site']} …"
+
+
 _deleting = {}  # message id -> subject, while its delete runs
 
 
@@ -3555,13 +3588,23 @@ def delete_mail_in_background(ui, wakes, message_id, subject):
     _deleting[message_id] = subject
 
     def run():
+        offer, deleted = None, False
         try:
+            if mail_is_list(message_id):  # read before the delete: the cached copy goes with it
+                try:
+                    offer = unsubscribe_offer(message_id)
+                except Exception:  # noqa: BLE001 - the delete still counts
+                    offer = None
             said = delete_mail(message_id, subject)
+            deleted = said.startswith("deleted")
         except Exception as e:  # noqa: BLE001 - say it rather than lose it with the thread
             said = f"couldn't delete it: {type(e).__name__}: {str(e)[:60]}"
         finally:
             _deleting.pop(message_id, None)
         ui.say(said, 4)
+        if deleted and offer and not (ui.confirm or ui.prompt):
+            ui.confirm = (viewer_module().unsubscribe_question(offer),
+                          lambda: unsubscribe_in_background(ui, wakes, offer))
         wakes[1].set()
     threading.Thread(target=run, daemon=True).start()
     wakes[1].set()
