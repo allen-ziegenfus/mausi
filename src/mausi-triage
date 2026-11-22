@@ -47,6 +47,10 @@ NOTIFY_IGNORE = {"Slack", "Mail", "Claude Code", "1Password"}  # Slack and mail 
 TEXT_MAX = 300
 KEEP_MAX = 30  # items on the list at most; beyond that the ones not seen longest go
 URGENCY = {"now": 0, "today": 1, "soon": 2}
+PACKAGE_WINDOW = 14 * 86400
+PACKAGE_SUBJECT = re.compile(r"(?i)\b(shipped|ships|shipping confirmation|shipment|on (its|the) way|out for delivery"
+                             r"|delivered|delivery|arriving|arrives|tracking|package|parcel"
+                             r"|versandt|verschickt|zugestellt|paket|sendung|lieferung)\b")
 
 
 SUBJECT_PREFIX = re.compile(r"(?i)^\s*((re|aw|wg|fwd?|sv|antw)\s*(\[\d+\])?\s*:\s*)+")
@@ -114,6 +118,12 @@ Team board parts (Jira sprints and support queues) count too: a new or
 unassigned ticket on a queue the team answers, someone else's comment or
 question on their ticket, and their sprint ticket with no status change for
 days (worth a word at standup) are worth an item.
+A package on its way (under "Shipping and delivery mail") is worth one
+"soon" item per order: what it is and the expected delivery day if a mail
+gives it, ref the order or tracking number (one ref per package, whichever
+mails about it share), source "mail". "today" when it arrives today or a
+mail says it was delivered or needs them (a signature, a failed delivery).
+Leave out ads and sales mail.
 Order by urgency: "now" (someone waits right now, or within the hour),
 "today", "soon". Merge items about the same thing. Use only facts from the
 digest; take URLs only from it. If nothing needs them, return no items.
@@ -210,6 +220,14 @@ def digest(doc):
             out.append(f"- {str(m.get('date', ''))[5:16].replace('T', ' ')} from {clip(m.get('from'), 50)}: "
                        f"{clip(m.get('subject'), 140)} · they replied {str(r.get('date', ''))[5:16].replace('T', ' ')}")
 
+    # Shipping mail, read or not: a package stays news until it arrives.
+    packages = [m for m in maildata.get("messages") or maildata.get("unread") or []
+                if mail_age(m) < PACKAGE_WINDOW and PACKAGE_SUBJECT.search(m.get("subject") or "")]
+    if packages:
+        out.append("## Shipping and delivery mail, last 14 days (read or not; may include ads)")
+        out += [f"- {str(m.get('date', ''))[5:16].replace('T', ' ')} from {clip(m.get('from'), 50)}: "
+                f"{clip(m.get('subject'), 160)}" + (f" — {clip(m.get('body'), 200)}" if m.get("body") and "{" not in m["body"][:300] else "")
+                for m in packages[:20]]
 
     notes = data("notifications") or {}
     dismissed = notes.get("dismissed") or {}
