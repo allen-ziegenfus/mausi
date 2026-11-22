@@ -128,7 +128,7 @@ Order by urgency: "now" (someone waits right now, or within the hour),
 "today", "soon". Merge items about the same thing. Use only facts from the
 digest; take URLs only from it. If nothing needs them, return no items.
 Items under "Already handled" were marked done by them: leave those out
-unless the digest shows something about them that arrived after that time.
+(the list drops them anyway for three days).
 Items under "Already on their list" stay there until they mark them done:
 list one again only when the digest shows something new about it or its
 urgency changed, and then with the same source and ref.
@@ -289,7 +289,9 @@ def on_list(items):
 
 def merge(prev, new, now):
     """The kept list: earlier items not marked done since they were last
-    listed, updated by this run's items (matched by source and ref)."""
+    listed, updated by this run's items (matched by source and ref). An item
+    marked done stays off while the done mark lasts (3 days), even if Claude
+    lists it again: it tends to re-list today's events as "news"."""
     done = {d["key"]: d["at"] for d in context.triage_done()}
     kept = {}
     for i in prev.get("items") or []:
@@ -299,6 +301,8 @@ def merge(prev, new, now):
             kept[key] = {**i, "first": i.get("first", seen), "seen": seen}
     for i in new or []:
         key = context.triage_key(i)
+        if key in done:
+            continue
         old = kept.get(key)
         kept[key] = {**i, "first": old["first"] if old else now, "seen": now}
     items = sorted(kept.values(), key=lambda i: -i["seen"])[:KEEP_MAX]

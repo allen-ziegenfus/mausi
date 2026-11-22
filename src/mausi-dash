@@ -2167,8 +2167,8 @@ def needs_lines(detail=False, width=None):
     error = f" {RED}{t['error'][:60]}{RESET}" if t.get("error") else ""
     lines = [(f"{head} {DIM}(Claude at {stamp} · d when handled · i asks again){RESET}{error}", None)]
     # The list keeps items until d marks them done. Marked done since an item
-    # was last listed: hidden. A later run was told about it, so an item it
-    # lists again has news.
+    # was last listed: hidden. Later runs drop it while the done mark lasts
+    # (mausi-triage merge), even if Claude lists it again.
     done = {d["key"]: d["at"] for d in context.triage_done()}
     items = [i for i in t.get("items") or [] if done.get(context.triage_key(i), 0) < i.get("seen", t.get("at", 0))]
     hidden = len(t.get("items") or []) - len(items)
