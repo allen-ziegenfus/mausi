@@ -2761,7 +2761,10 @@ _SOURCE = {"today": bool(cfg.get("commands", "calendar")), "mail": bool(cfg.get(
            "slack": os.path.exists(NOTIFICATIONS) or bool(cfg.get("notifications", "capture")),
            "notifications": os.path.exists(NOTIFICATIONS) or bool(cfg.get("notifications", "capture")),
            "docker": bool(shutil.which("docker")), "kube": bool(shutil.which("kubectl") or shutil.which("k3d"))}
-VIEW_SECTIONS = {view: tuple(n for n in names if _SOURCE.get(n, True)) for view, names in VIEW_SECTIONS.items()}
+_ORDER = cfg.get("dash", "section_order") or {}  # e.g. {Work = ["mail", "boards"]}: these first, the rest after
+VIEW_SECTIONS = {view: tuple(n for n in [*(k for k in _ORDER.get(view, []) if k in names),
+                                         *(k for k in names if k not in _ORDER.get(view, []))]
+                             if _SOURCE.get(n, True)) for view, names in VIEW_SECTIONS.items()}
 SECTION_TITLES = {"you": "You", "today": "Today", "standup": "Standup", "needs": "Needs you", "reminders": "Reminders", "projects": "Projects", "sessions": "Sessions", "docker": "Docker", "kube": "Kubernetes",
                   "notifications": "Notifications", "slack": "Slack", "mail": "Mail", "notes": "Notes", "prs": "PRs", "boards": "Boards", "jira": "Jira: assigned to me", "jira_created": "Jira: created by me", "recent": "Recently closed", "tasks": "Tasks",
                   "pinned": "Now (pinned tasks)"}

@@ -58,6 +58,7 @@ DEFAULTS = {
         "hide_tasks": [],                   # tasks whose title contains one of these aren't shown
         "late_hour": 20,                    # active time after this hour is flagged
         "github_user": "",                  # for the PR lists; empty = ask gh
+        "section_order": {},                # per view ("Now", "Work"): section keys listed first, in this order
     },
     "breaks": {
         "gap_minutes": 5,                   # a pause this long between your prompts is a break

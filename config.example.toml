@@ -15,6 +15,7 @@ list_sections = ["Follow-ups"]   # overview sections listed task by task; the ot
 hide_tasks = []                  # tasks whose title contains one of these stay off the dashboard
 late_hour = 20                   # active time after this hour gets a "wrap up?"
 github_user = ""                 # your GitHub login, for the PR lists
+section_order = {}               # per view, sections listed first: {Work = ["mail", "boards"]}
 
 [breaks]
 gap_minutes = 5                  # a pause this long between your prompts counts as a break
