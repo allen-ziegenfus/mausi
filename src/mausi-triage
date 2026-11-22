@@ -29,6 +29,7 @@ lets the collector run it every 30 minutes.
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -46,6 +47,29 @@ NOTIFY_IGNORE = {"Slack", "Mail", "Claude Code", "1Password"}  # Slack and mail 
 TEXT_MAX = 300
 KEEP_MAX = 30  # items on the list at most; beyond that the ones not seen longest go
 URGENCY = {"now": 0, "today": 1, "soon": 2}
+
+
+SUBJECT_PREFIX = re.compile(r"(?i)^\s*((re|aw|wg|fwd?|sv|antw)\s*(\[\d+\])?\s*:\s*)+")
+
+
+def thread_subject(subject):
+    return re.sub(r"\s+", " ", SUBJECT_PREFIX.sub("", subject or "")).strip().lower()
+
+
+def replied(m, sent):
+    """The sent mail that answers m, sent after it: one whose References name m
+    or the mail m itself answers, else one to its sender with the same subject
+    (Re:/AW: left off). None if there's none."""
+    keys = {k for k in [m.get("id_key"), *(m.get("ref_keys") or [])] if k}
+    subject, sender = thread_subject(m.get("subject")), (m.get("from_addr") or "").lower()
+    for s in sent:
+        if str(s.get("date", "")) < str(m.get("date", "")):
+            continue
+        if keys & set(s.get("ref_keys") or []):
+            return s
+        if subject and sender in (s.get("to_addrs") or []) and thread_subject(s.get("subject")) == subject:
+            return s
+    return None
 
 
 def model():
@@ -168,13 +192,24 @@ def digest(doc):
         except ValueError:
             return 0  # an odd date: keep the mail rather than fail the whole run
 
-    mail = [m for m in (data("mail") or {}).get("unread", []) if mail_age(m) < MAIL_WINDOW]
+    maildata = data("mail") or {}
+    sent = maildata.get("sent") or []
+    mail = [m for m in maildata.get("unread", []) if mail_age(m) < MAIL_WINDOW]
+    answers = [replied(m, sent) for m in mail]
+    answered = [(m, r) for m, r in zip(mail, answers) if r]
+    mail = [m for m, r in zip(mail, answers) if not r]
     if mail:
         out.append("## Unread mail, last 24h")
         for m in mail[:30]:
             tags = ", ".join(t for t, on in (("to me", m.get("to_me")), ("list", m.get("list")), ("starred", m.get("starred"))) if on)
             out.append(f"- {str(m.get('date', ''))[5:16].replace('T', ' ')} from {clip(m.get('from'), 50)} ({tags}): "
                        f"{clip(m.get('subject'), 140)} — {clip(m.get('body'), 200)} · {m.get('url')}")
+    if answered:
+        out.append("## Unread mail they have already replied to (waiting on the other side; not an action unless overdue)")
+        for m, r in answered[:30]:
+            out.append(f"- {str(m.get('date', ''))[5:16].replace('T', ' ')} from {clip(m.get('from'), 50)}: "
+                       f"{clip(m.get('subject'), 140)} · they replied {str(r.get('date', ''))[5:16].replace('T', ' ')}")
+
 
     notes = data("notifications") or {}
     dismissed = notes.get("dismissed") or {}

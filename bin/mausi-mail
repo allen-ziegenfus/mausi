@@ -13,8 +13,10 @@ access token (for accounts without app passwords; e.g. one that asks GNOME
 Online Accounts), it signs in with XOAUTH2 instead. --user-cmd prints the
 user name, in place of --user.
 
-Prints {"unread": [...], "messages": [...]}: the last --days days of the
-Inbox (default 14), newest first, in the fields mausi's Mail section reads.
+Prints {"unread": [...], "messages": [...], "sent": [...]}: the last --days
+days of the Inbox (default 14), newest first, in the fields mausi's Mail
+section reads; "sent" is the Sent folder's mails of those days (date,
+subject, recipients, hashed thread ids), so a mail already answered shows.
 
     mausi-mail ... --raw MESSAGE-ID      # the whole mail (RFC 822), still unread
     mausi-mail ... --delete MESSAGE-ID   # move it to the trash folder
@@ -246,9 +248,54 @@ def summary(meta, raw, mine, web, folder=None):
            # an id that couldn't be used safely (quotes, brackets, spaces) isn't given out at all:
            # it could be typed into a shell or a command
            "message_id": safe_id(msg.get("Message-ID")), "url": web, "body": snippet(msg)}
+    # hashed thread ids (own id, then In-Reply-To/References): enough to tell a
+    # reply from its mail, without passing ids from mail around
+    out["id_key"] = id_key(msg.get("Message-ID"))
+    out["ref_keys"] = [id_key(r) for r in re.findall(r"<[^<>]*>", " ".join(
+        str(msg.get(h) or "") for h in ("In-Reply-To", "References")))][-20:]
     if folder:
         out["folder"] = folder
     return out
+
+
+def id_key(value):
+    mid = message_id(value)
+    return hashlib.sha1(mid.encode()).hexdigest()[:16] if mid else ""
+
+
+def sent_folder(imap):
+    """The folder flagged \\Sent, else one named like it, or None."""
+    found = folders(imap)
+    for name, _, flags in found:
+        if "\\Sent" in flags:
+            return name
+    for name, shown, _ in found:
+        if re.fullmatch(r"(?i)sent( items| messages| mail)?|gesendet(e( objekte| elemente)?)?|envoy[ée]s", shown):
+            return name
+    return None
+
+
+def sent_list(imap, days):
+    """The mails sent in the last days (headers only), for telling which mail
+    has been answered: date, subject, recipients, thread keys."""
+    box = sent_folder(imap)
+    if not box or imap.select(box, readonly=True)[0] != "OK":
+        return []
+    since = (datetime.date.today() - datetime.timedelta(days=days)).strftime("%d-%b-%Y")
+    _, data = imap.uid("search", None, "SINCE", since)
+    uids = data[0].split()[-MAX:] if data and data[0] else []
+    if not uids:
+        return []
+    _, rows = imap.uid("fetch", b",".join(uids), "(UID FLAGS BODY.PEEK[HEADER])")
+    out = []
+    for row in rows:
+        if isinstance(row, tuple):
+            m = summary(row[0], row[1], set(), "")
+            msg = email.message_from_bytes(row[1])
+            m["to_addrs"] = sorted({x[1].lower() for x in email.utils.getaddresses(
+                [text(msg.get("To")), text(msg.get("Cc"))]) if x[1]})
+            out.append({k: m[k] for k in ("date", "subject", "to_addrs", "id_key", "ref_keys")})
+    return sorted(out, key=lambda m: m["date"], reverse=True)
 
 
 def criteria(query):
@@ -522,12 +569,18 @@ def main():
                     cache_sync(imap, a.cache, listed)
                 except (imaplib.IMAP4.error, OSError) as e:  # the list still counts
                     print(f"cache: {e}", file=sys.stderr)
+        try:
+            sent = sent_list(imap, a.days)
+        except (imaplib.IMAP4.error, OSError) as e:  # the Inbox still counts
+            print(f"sent: {e}", file=sys.stderr)
+            sent = []
         imap.logout()
     except (imaplib.IMAP4.error, OSError) as e:
         print(f"IMAP {a.host}: {e}", file=sys.stderr)
         return 1
     messages.sort(key=lambda m: m["date"], reverse=True)
-    print(json.dumps({"unread": [m for m in messages if not m["read"]], "messages": messages}, ensure_ascii=False))
+    print(json.dumps({"unread": [m for m in messages if not m["read"]], "messages": messages, "sent": sent},
+                     ensure_ascii=False))
     return 0
 
 
