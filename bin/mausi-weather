@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""mausi-weather: big changes in the weather, for mausi's [commands] weather.
+Python 3.9+, standard library only. Uses Open-Meteo (no key, no account).
+
+    mausi-weather --lat 52.52 --lon 13.40 [--units us|metric]
+                  [--temp-diff N] [--rain N] [--snow N]
+
+Compares today with yesterday and tomorrow with today, and says when a day is
+much colder or warmer (the high or the feels-like high moved by --temp-diff
+or more: default 10 °F / 6 °C), wet after a dry day (--rain: default 0.1 in /
+2.5 mm), or brings snow (--snow: default 0.5 in / 10 mm) or freezing rain.
+
+Prints {"alerts": [{"day", "kind", "text"}], "days": [{"date", "high", "low",
+"feels_high", "rain", "snow", "code"}], "units"}: alerts for today and
+tomorrow, nothing when the weather stays about the same.
+"""
+import argparse
+import datetime
+import json
+import sys
+import urllib.parse
+import urllib.request
+
+API = "https://api.open-meteo.com/v1/forecast"
+FREEZING = {56, 57, 66, 67}
+STORM = {95, 96, 99}
+
+
+def fetch(lat, lon, us):
+    q = {"latitude": lat, "longitude": lon, "timezone": "auto", "past_days": 1, "forecast_days": 2,
+         "daily": "temperature_2m_max,temperature_2m_min,apparent_temperature_max,"
+                  "rain_sum,showers_sum,snowfall_sum,weather_code"}
+    if us:
+        q |= {"temperature_unit": "fahrenheit", "precipitation_unit": "inch"}
+    with urllib.request.urlopen(f"{API}?{urllib.parse.urlencode(q)}", timeout=20) as r:
+        d = json.load(r)["daily"]
+    # snow comes in inches with precipitation_unit=inch, else in cm: make that mm
+    snow = [(s or 0) if us else (s or 0) * 10 for s in d["snowfall_sum"]]
+    return [{"date": d["time"][i], "high": d["temperature_2m_max"][i], "low": d["temperature_2m_min"][i],
+             "feels_high": d["apparent_temperature_max"][i],
+             "rain": (d["rain_sum"][i] or 0) + (d["showers_sum"][i] or 0), "snow": snow[i],
+             "code": d["weather_code"][i]} for i in range(len(d["time"]))]
+
+
+def compare(prev, day, label, a, us):
+    """The alerts for one day, against the day before."""
+    deg, amt = ("°F", "in") if us else ("°C", "mm")
+    out = []
+    say = lambda kind, text: out.append({"day": day["date"], "kind": kind, "text": f"{label}: {text}"})  # noqa: E731
+    temps = f"{day['high']:.0f}/{day['low']:.0f}{deg}, feels {day['feels_high']:.0f}"
+    dh, df = day["high"] - prev["high"], day["feels_high"] - prev["feels_high"]
+    d = max(dh, df, key=abs)
+    if abs(d) >= a.temp_diff:
+        say("colder" if d < 0 else "warmer",
+            f"{temps} — {abs(d):.0f}° {'colder' if d < 0 else 'warmer'} than {'yesterday' if label == 'Today' else 'today'}")
+    if day["code"] in FREEZING:
+        say("ice", "freezing rain or drizzle")
+    if day["snow"] >= a.snow:
+        say("snow", f"snow, {day['snow']:.1f} {'in' if us else 'mm'}")
+    elif day["rain"] >= a.rain and prev["rain"] < a.rain:
+        say("rain", f"rain, {day['rain']:.{2 if us else 0}f} {amt}"
+            + (" with thunderstorms" if day["code"] in STORM else ""))
+    return out
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p.add_argument("--lat", type=float, required=True)
+    p.add_argument("--lon", type=float, required=True)
+    p.add_argument("--units", choices=("us", "metric"), default="us")
+    p.add_argument("--temp-diff", type=float)
+    p.add_argument("--rain", type=float)
+    p.add_argument("--snow", type=float)
+    a = p.parse_args()
+    us = a.units == "us"
+    a.temp_diff = a.temp_diff if a.temp_diff is not None else (10 if us else 6)
+    a.rain = a.rain if a.rain is not None else (0.1 if us else 2.5)
+    a.snow = a.snow if a.snow is not None else (0.5 if us else 10)
+    try:
+        days = fetch(a.lat, a.lon, us)
+    except Exception as e:
+        print(f"mausi-weather: {e}", file=sys.stderr)
+        sys.exit(1)
+    today = datetime.date.today().isoformat()
+    i = next((n for n, d in enumerate(days) if d["date"] == today), 1)
+    alerts = []
+    # a day with a missing value (null from the API) is left out of the comparison
+    known = lambda d: None not in (d["high"], d["low"], d["feels_high"])  # noqa: E731
+    days_ok = [known(d) for d in days]
+    if i >= 1 and days_ok[i - 1] and days_ok[i]:
+        alerts += compare(days[i - 1], days[i], "Today", a, us)
+    if i + 1 < len(days) and days_ok[i] and days_ok[i + 1]:
+        alerts += compare(days[i], days[i + 1], datetime.date.fromisoformat(days[i + 1]["date"]).strftime("%a"), a, us)
+    json.dump({"alerts": alerts, "days": days, "units": a.units}, sys.stdout)
+    print()
+
+
+if __name__ == "__main__":
+    main()

@@ -70,6 +70,8 @@ forward_name = ""                # who that is ("waiting on <name>", the stage l
 
 [commands]
 calendar = ""                    # prints today's meetings as JSON; an optional YYYY-MM-DD argument for another day
+weather = ""                     # big weather changes at the top of Today, and for triage, e.g.
+                                 # "~/mausi/bin/mausi-weather --lat 52.52 --lon 13.40 --units metric"
 mail = ""                        # prints unread mail as JSON
 mail_open = ""                   # opens one mail; {id} becomes its Message-ID
 reminders = ""                   # prints open reminders/to-dos as JSON ({"items": [...]}; see the README)

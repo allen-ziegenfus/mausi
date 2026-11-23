@@ -194,6 +194,7 @@ if not cfg.BOARD:  # the collector never fetches a board then: Tasks reads the o
     work_data = {"error": "no board configured"}
 meetings = {"events": [], "synced": None, "error": None}
 meetings_tomorrow = {"events": []}
+weather = {"alerts": []}  # [commands] weather: big changes today and tomorrow
 mail = None  # the mail command's output: Inbox mail (all of it in zoom, unread otherwise)
 projects_data = None  # the projects source: {"groups": [{"name", "projects": [...]}]}
 PROJECTS_MAX = 6  # rows per group in the dashboard; zoom shows them all
@@ -2261,14 +2262,23 @@ def standup_lines(detail=False, width=None):
     return lines
 
 
+WEATHER_MARK = {"colder": (CYAN, "↓"), "warmer": (YELLOW, "↑"), "rain": (CYAN, "☂"),
+                "snow": (BOLD, "❄"), "ice": (RED, "⚠")}
+
+
 def meeting_lines(detail=False):
     with lock:
-        data, later = meetings, meetings_tomorrow
+        data, later, alerts = meetings, meetings_tomorrow, weather.get("alerts") or []
     now = time.time()
     synced = data.get("synced")
     head = f"{BOLD}Today{RESET}"
+    weather_lines = []
+    for a in alerts:
+        if isinstance(a, dict):
+            color, mark = WEATHER_MARK.get(a.get("kind"), (YELLOW, "!"))
+            weather_lines.append((f"  {color}{mark} {a.get('text', '')}{RESET}", None))
     if data["error"]:
-        return [(f"{head} {RED}{data['error']}{RESET}", None)]
+        return [(f"{head} {RED}{data['error']}{RESET}", None)] + weather_lines
     if synced:
         # "synced" is when the calendar source last changed, so an old time is
         # normal; it's only stale when the command says its source isn't running.
@@ -2276,7 +2286,8 @@ def meeting_lines(detail=False):
             head += f" {DIM}last change {synced[11:16]}{RESET}"
         else:
             head += f" {RED}the calendar app isn't running — showing the copy from {synced[11:16]}{RESET}"
-    lines = [(head, None)]
+    lines = [(head, None)] + weather_lines
+    first = len(lines)
     upcoming = None
     for e in data["events"]:
         action = {"detail": (f"{e['start'][11:16]}–{e['end'][11:16]}"
@@ -2306,7 +2317,7 @@ def meeting_lines(detail=False):
             lines.append((f"  {span}  {e['title']}{soon}", action))
         if detail:
             lines += meeting_extra(e)
-    if len(lines) == 1:
+    if len(lines) == first:
         lines.append((f"  {DIM}no meetings{RESET}", None))
     if detail:
         lines += [("", None), (f"{BOLD}Tomorrow{RESET}", None)]
@@ -2753,7 +2764,7 @@ VIEW_SECTIONS = {"Now": ("you", "today", "standup", "needs", "reminders", "sessi
                  "Work": ("slack", "notifications", "mail", "notes", "prs", "boards", "jira", "jira_created", "recent")}
 # Sections whose source isn't set up are left out: the board (PRs, Jira), the
 # calendar and mail commands, and the notification log (Linux capture).
-_SOURCE = {"today": bool(cfg.get("commands", "calendar")), "mail": bool(cfg.get("commands", "mail")),
+_SOURCE = {"today": bool(cfg.get("commands", "calendar") or cfg.get("commands", "weather")), "mail": bool(cfg.get("commands", "mail")),
            "reminders": bool(REMINDERS_CMD), "projects": bool(cfg.config().get("projects")),
            "prs": cfg.BOARD, "boards": cfg.BOARD, "jira": cfg.BOARD, "jira_created": cfg.BOARD, "recent": cfg.BOARD,
            "needs": bool(cfg.get("triage", "enabled")),
@@ -3932,7 +3943,7 @@ class Wake:
 
 def on_context(name, entry):
     """A source has new data: hand it to the section globals the views read."""
-    global work_data, infra_data, mail, reminders, projects_data, meetings, meetings_tomorrow
+    global work_data, infra_data, mail, reminders, projects_data, meetings, meetings_tomorrow, weather
     data, error = entry.get("data"), entry.get("error")
     with lock:
         # An error shows as before, in place of the section; the collector
@@ -3948,6 +3959,9 @@ def on_context(name, entry):
         elif name == "reminders":
             # one command failing leaves the others' items, with the error shown
             reminders = {"items": [], "error": error} if data is None else dict(data, error=error)
+        elif name == "weather":
+            if isinstance(data, dict):  # a failed fetch keeps the last alerts
+                weather = data
         elif name == "calendar":
             today = (data or {}).get("today") or {"events": [], "synced": None}
             meetings = dict(today, error=error if not today.get("events") and error else None)

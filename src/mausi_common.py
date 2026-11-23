@@ -123,6 +123,7 @@ DEFAULTS = {
     },
     "commands": {
         "calendar": "",                     # prints today's meetings as JSON (optional arg: YYYY-MM-DD)
+        "weather": "",                      # prints {"alerts": [{"text"}]} for big changes (e.g. bin/mausi-weather)
         "mail": "",                         # prints unread mail as JSON
         "mail_open": "",                    # opens one mail; {id} is replaced with its Message-ID
         "reminders": "",                    # prints open reminders/to-dos as JSON ({"items": [...]}); --complete ID marks

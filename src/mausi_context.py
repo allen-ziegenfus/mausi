@@ -41,6 +41,7 @@ VERSION = 1
 BOARD_URL = cfg.get("board", "url").rstrip("/")
 JIRA_SITE = cfg.get("jira", "site").rstrip("/")
 CALENDAR_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "calendar")))
+WEATHER_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "weather")))
 MAIL_CMD = shlex.split(os.path.expanduser(cfg.get("commands", "mail")))
 REMINDERS_CMDS = cfg.reminders_commands()
 MAIL_SYNC_CMD = shlex.split(os.path.expanduser(cfg.get("mail", "sync")))
@@ -256,6 +257,14 @@ def fetch_calendar(hard=False):
     except (TypeError, json.JSONDecodeError):
         return {"today": {"events": [], "synced": None}, "tomorrow": later}, f"{CALENDAR_CMD[0]} failed"
     return {"today": today, "tomorrow": later}, None
+
+
+def fetch_weather(hard=False):
+    """The weather command's output: {"alerts": [{"day", "kind", "text"}], ...}."""
+    try:
+        return cfg.clean(json.loads(run(WEATHER_CMD, 60) or "")), None
+    except (TypeError, json.JSONDecodeError):
+        return None, f"{WEATHER_CMD[0]} failed"
 
 
 def kubectl_json(*args):
@@ -495,6 +504,7 @@ SOURCES = {
     "board": (fetch_board, 60 if BOARD_URL else 180, cfg.BOARD),  # a command (e.g. gh) is slower: every 3 min
     "mail": (fetch_mail, 120, bool(MAIL_CMD)),
     "calendar": (fetch_calendar, 120, bool(CALENDAR_CMD)),
+    "weather": (fetch_weather, 1800, bool(WEATHER_CMD)),  # forecasts change slowly
     "reminders": (fetch_reminders, 120, bool(REMINDERS_CMDS)),
     "mail_sync": (fetch_mail_sync, 300, bool(MAIL_SYNC_CMD)),
     "projects": (fetch_projects, 60, bool(cfg.config().get("projects"))),

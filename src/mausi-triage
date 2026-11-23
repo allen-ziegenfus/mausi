@@ -92,7 +92,7 @@ SCHEMA = {
                     "title": {"type": "string", "description": "What to do, imperative, under 80 characters."},
                     "why": {"type": "string", "description": "One short sentence: who is waiting or what is at stake."},
                     "urgency": {"type": "string", "enum": ["now", "today", "soon"]},
-                    "source": {"type": "string", "enum": ["mail", "slack", "notification", "pr", "jira", "calendar", "task", "other"]},
+                    "source": {"type": "string", "enum": ["mail", "slack", "notification", "pr", "jira", "calendar", "weather", "task", "other"]},
                     "ref": {"type": "string", "description": "The Jira key, PR ref (owner/repo#n), Slack conversation or mail subject it is about."},
                     "url": {"type": "string", "description": "A URL from the digest to open it, or empty."},
                 },
@@ -124,6 +124,11 @@ gives it, ref the order or tracking number (one ref per package, whichever
 mails about it share), source "mail". "today" when it arrives today or a
 mail says it was delivered or needs them (a signature, a failed delivery).
 Leave out ads and sales mail.
+A weather change (under "Weather": much colder or warmer than the day
+before, rain after a dry day, snow, ice) is worth one item per day: what to
+adjust (a coat, an umbrella, more time to get somewhere), all the more when
+the calendar has something outside that day; source "weather", ref the
+date. "today" for today's change, "soon" for tomorrow's.
 Order by urgency: "now" (someone waits right now, or within the hour),
 "today", "soon". Merge items about the same thing. Use only facts from the
 digest; take URLs only from it. If nothing needs them, return no items.
@@ -160,6 +165,14 @@ def digest(doc):
     if upcoming:
         out.append("## Calendar, rest of today")
         out += [f"- {e['start'][11:16]}–{e['end'][11:16]} {clip(e['title'], 100)}" for e in upcoming]
+
+    # day and kind only: the forecast's degrees move every refresh, and the
+    # digest must stay the same for triage not to run again
+    weather = data("weather")
+    alerts = [a for a in (weather.get("alerts") or []) if isinstance(a, dict)] if isinstance(weather, dict) else []
+    if alerts:
+        out.append(f"## Weather: big changes (today is {time.strftime('%Y-%m-%d')})")
+        out += [f"- {a.get('day')}: {a.get('kind')}" for a in alerts]
 
     tasks = (data("board") or {}).get("tasks") or []
     now_tasks = next((s.get("items", []) for s in tasks if s.get("title") == "Now"), [])
